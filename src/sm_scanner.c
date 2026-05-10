@@ -31,6 +31,7 @@
 
 typedef enum {
   SCANNER_WATCH_SCAN_ROOT = 0,
+  SCANNER_WATCH_SCAN_ROOT_PARENT,
   SCANNER_WATCH_SCAN_BACKPORT_ROOT,
   SCANNER_WATCH_SCAN_SUBDIR,
   SCANNER_WATCH_SCAN_IMAGE_FILE,
@@ -50,8 +51,11 @@ typedef struct {
   bool dirty;
   bool cleanup_pending;
   bool watch_tree_stale;
+  bool root_present;
   uint8_t watch_tree_rebuild_depth;
   scanner_watch_kind_t watch_tree_rebuild_kind;
+  uint64_t root_device;
+  uint64_t root_inode;
   uint64_t ready_after_us;
   char watch_tree_rebuild_path[MAX_PATH];
 } scanner_root_state_t;
@@ -456,6 +460,59 @@ static bool build_parent_directory_path(const char *path,
   return true;
 }
 
+static bool stat_directory_identity(const char *path, uint64_t *device_out,
+                                    uint64_t *inode_out) {
+  struct stat st;
+  if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
+    return false;
+
+  if (device_out)
+    *device_out = (uint64_t)st.st_dev;
+  if (inode_out)
+    *inode_out = (uint64_t)st.st_ino;
+  return true;
+}
+
+static bool update_scan_root_presence_state(int scan_root_index,
+                                            const char *scan_root,
+                                            bool *present_out) {
+  uint64_t root_device = 0;
+  uint64_t root_inode = 0;
+  bool present =
+      stat_directory_identity(scan_root, &root_device, &root_inode);
+  scanner_root_state_t *state = &g_scanner_root_states[scan_root_index];
+  bool changed = state->root_present != present;
+  if (present && state->root_present &&
+      (state->root_device != root_device || state->root_inode != root_inode)) {
+    changed = true;
+  }
+
+  state->root_present = present;
+  state->root_device = present ? root_device : 0;
+  state->root_inode = present ? root_inode : 0;
+  *present_out = present;
+  return changed;
+}
+
+static bool resolve_existing_parent_directory_path(
+    const char *path, char parent_path[MAX_PATH]) {
+  char current_path[MAX_PATH];
+  (void)strlcpy(current_path, path, sizeof(current_path));
+
+  while (true) {
+    char candidate_parent[MAX_PATH];
+    if (!build_parent_directory_path(current_path, candidate_parent))
+      return false;
+    if (strcmp(candidate_parent, current_path) == 0)
+      return false;
+    if (stat_directory_identity(candidate_parent, NULL, NULL)) {
+      (void)strlcpy(parent_path, candidate_parent, MAX_PATH);
+      return true;
+    }
+    (void)strlcpy(current_path, candidate_parent, sizeof(current_path));
+  }
+}
+
 static bool resolve_watch_tree_rebuild_target(const scanner_watch_entry_t *entry,
                                               char rebuild_path[MAX_PATH],
                                               uint8_t *rebuild_depth_out,
@@ -467,6 +524,12 @@ static bool resolve_watch_tree_rebuild_target(const scanner_watch_entry_t *entry
     (void)strlcpy(rebuild_path, entry->path, MAX_PATH);
     *rebuild_depth_out = entry->depth;
     *kind_out = entry->kind;
+    return true;
+  case SCANNER_WATCH_SCAN_ROOT_PARENT:
+    (void)strlcpy(rebuild_path, get_scan_path(entry->scan_root_index),
+                  MAX_PATH);
+    *rebuild_depth_out = 0;
+    *kind_out = SCANNER_WATCH_SCAN_ROOT;
     return true;
   case SCANNER_WATCH_SCAN_IMAGE_FILE:
     if (!build_parent_directory_path(entry->path, rebuild_path))
@@ -511,10 +574,30 @@ static bool register_watch_image_visit(const char *image_path,
                                       (uint8_t)depth_from_root);
 }
 
+static bool register_scan_root_parent_watch(int kq, int scan_root_index,
+                                            const char *scan_root) {
+  char parent_path[MAX_PATH];
+  if (!resolve_existing_parent_directory_path(scan_root, parent_path))
+    return true;
+
+  return register_scanner_watch_entry(kq, scan_root_index, parent_path,
+                                      SCANNER_WATCH_SCAN_ROOT_PARENT, 0u);
+}
+
 static bool rebuild_scan_root_watch_tree(int kq, int scan_root_index) {
   const char *scan_root = get_scan_path(scan_root_index);
   if (!remove_scan_root_watch_entries(scan_root_index))
     return false;
+
+  bool root_present = false;
+  (void)update_scan_root_presence_state(scan_root_index, scan_root,
+                                        &root_present);
+  if (!root_present) {
+    if (!register_scan_root_parent_watch(kq, scan_root_index, scan_root))
+      return false;
+    clear_scan_root_watch_tree_state(scan_root_index);
+    return true;
+  }
 
   unsigned int scan_depth = runtime_config()->scan_depth;
   if (scan_depth < MIN_SCAN_DEPTH)
@@ -540,6 +623,9 @@ static bool rebuild_scan_root_watch_tree(int kq, int scan_root_index) {
       return false;
     }
   }
+
+  if (!register_scan_root_parent_watch(kq, scan_root_index, scan_root))
+    return false;
 
   clear_scan_root_watch_tree_state(scan_root_index);
   return true;
@@ -974,6 +1060,35 @@ static const struct timespec *build_wait_timeout(struct timespec *timeout,
   return timeout;
 }
 
+static bool handle_scan_root_parent_event(
+    int kq, const scanner_watch_entry_t *entry, uint64_t now_us) {
+  const char *scan_root = get_scan_path(entry->scan_root_index);
+  bool root_present = false;
+  bool root_changed = update_scan_root_presence_state(
+      entry->scan_root_index, scan_root, &root_present);
+  if (root_present && root_changed) {
+    schedule_scan_root_dirty(entry->scan_root_index, now_us, false);
+    schedule_scan_root_watch_tree_rebuild(entry);
+    return true;
+  }
+  if (root_present)
+    return true;
+  if (root_changed) {
+    schedule_scan_root_cleanup(entry->scan_root_index);
+    schedule_scan_root_dirty(entry->scan_root_index, now_us, true);
+    schedule_scan_root_watch_tree_rebuild(entry);
+    return true;
+  }
+
+  char parent_path[MAX_PATH];
+  if (!resolve_existing_parent_directory_path(scan_root, parent_path) ||
+      strcmp(parent_path, entry->path) != 0) {
+    return rebuild_scan_root_watch_tree(kq, entry->scan_root_index);
+  }
+
+  return true;
+}
+
 static bool process_scanner_events(int kq, const struct timespec *timeout,
                                    bool *timed_out_out) {
   *timed_out_out = false;
@@ -1027,6 +1142,12 @@ static bool process_scanner_events(int kq, const struct timespec *timeout,
         find_scanner_watch_entry_by_fd(event->ident);
     if (!watch_entry)
       continue;
+
+    if (watch_entry->kind == SCANNER_WATCH_SCAN_ROOT_PARENT) {
+      if (!handle_scan_root_parent_event(kq, watch_entry, now_us))
+        return false;
+      continue;
+    }
 
     bool immediate =
         (event->fflags & (NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE)) != 0;
