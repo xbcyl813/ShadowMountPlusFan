@@ -31,6 +31,10 @@ void sm_kstuff_game_on_exit(pid_t pid);
 void sm_kstuff_game_poll(void);
 // Clear tracked game state and restore kstuff if the watcher paused it.
 void sm_kstuff_game_shutdown(void);
+// Pause kstuff for runtime sleep without restoring game-driven pauses.
+void sm_kstuff_sleep_enter(void);
+// Restore kstuff after runtime sleep when sleep entry disabled it.
+void sm_kstuff_sleep_leave(void);
 // Re-apply runtime config changes to the currently tracked game, if any.
 void sm_kstuff_on_config_reload(void);
 

@@ -503,7 +503,7 @@ static void *game_lifecycle_watcher_main(void *arg) {
         suspended_game_pid = atomic_load(&g_active_game_pid);
         clear_all_pending_game_launches();
         sm_fakelib_game_shutdown();
-        sm_kstuff_game_shutdown();
+        sm_kstuff_sleep_enter();
         publish_active_game(0, NULL);
         sleep_cleanup_done = true;
       }
@@ -527,6 +527,7 @@ static void *game_lifecycle_watcher_main(void *arg) {
         break;
       sleep_cleanup_done = false;
       restore_suspended_game_if_alive(kq, suspended_game_pid);
+      sm_kstuff_sleep_leave();
       suspended_game_pid = 0;
     }
 

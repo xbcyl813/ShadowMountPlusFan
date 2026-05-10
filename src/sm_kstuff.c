@@ -35,6 +35,7 @@ typedef struct {
   bool probe_available;
   bool supported;
   bool restore_on_empty;
+  bool sleep_pause_restore;
   bool current_app_focus_valid;
   uint32_t current_app_focus_id;
   uint64_t restore_retry_us;
@@ -817,10 +818,48 @@ void sm_kstuff_game_poll(void) {
 
 void sm_kstuff_game_shutdown(void) {
   bool restore_needed = tracked_game_requires_restore();
+  if (g_kstuff.sleep_pause_restore) {
+    restore_needed = true;
+    g_kstuff.sleep_pause_restore = false;
+  }
   sm_mdbg_game_shutdown();
   memset(&g_kstuff.game, 0, sizeof(g_kstuff.game));
-  if (restore_needed)
-    finish_tracked_game_clear("watcher shutdown");
+  if (restore_needed) {
+    mark_restore_needed();
+    restore_kstuff_if_needed("watcher shutdown");
+  }
+}
+
+void sm_kstuff_sleep_enter(void) {
+  bool was_enabled = false;
+  bool fully_disabled = false;
+
+  sm_mdbg_game_shutdown();
+  memset(&g_kstuff.game, 0, sizeof(g_kstuff.game));
+  g_kstuff.sleep_pause_restore = false;
+
+  if (!sm_kstuff_is_supported())
+    return;
+
+  was_enabled = sm_kstuff_is_enabled();
+  g_kstuff.sleep_pause_restore = was_enabled;
+  (void)apply_kstuff_enabled_state(false, false, &fully_disabled);
+  if (!fully_disabled) {
+    log_debug("  [KSTUFF] failed to pause for system sleep");
+    return;
+  }
+
+  if (was_enabled)
+    log_debug("  [KSTUFF] paused for system sleep");
+}
+
+void sm_kstuff_sleep_leave(void) {
+  if (!g_kstuff.sleep_pause_restore)
+    return;
+
+  g_kstuff.sleep_pause_restore = false;
+  mark_restore_needed();
+  restore_kstuff_if_needed("system sleep");
 }
 
 void sm_kstuff_on_config_reload(void) {
