@@ -14,8 +14,11 @@ static sqlite3 *g_app_db;
 static sqlite3_stmt *g_app_db_stmt_update_snd0;
 static sqlite3_stmt *g_app_db_stmt_normalize_snd0;
 static struct AppDbTitleList g_app_db_title_cache;
+static struct AppDbTitleList g_app_db_blocked_uninstall_ppsa_cache;
 static bool g_app_db_title_cache_ready = false;
+static bool g_app_db_blocked_uninstall_ppsa_cache_ready = false;
 static time_t g_app_db_title_cache_mtime = 0;
+static time_t g_app_db_blocked_uninstall_ppsa_cache_mtime = 0;
 static pthread_mutex_t g_app_db_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define APP_DB_STARTUP_MAINTENANCE_RETRIES 3
@@ -46,8 +49,11 @@ void free_app_db_title_list(struct AppDbTitleList *list) {
 void shutdown_app_db(void) {
   pthread_mutex_lock(&g_app_db_mutex);
   free_app_db_title_list(&g_app_db_title_cache);
+  free_app_db_title_list(&g_app_db_blocked_uninstall_ppsa_cache);
   g_app_db_title_cache_ready = false;
+  g_app_db_blocked_uninstall_ppsa_cache_ready = false;
   g_app_db_title_cache_mtime = 0;
+  g_app_db_blocked_uninstall_ppsa_cache_mtime = 0;
   close_app_db();
   pthread_mutex_unlock(&g_app_db_mutex);
 }
@@ -348,6 +354,49 @@ bool app_db_title_list_contains(const struct AppDbTitleList *list,
                  compare_title_id_str) != NULL;
 }
 
+static bool step_app_db_title_query(struct AppDbTitleList *list,
+                                    sqlite3_stmt *stmt,
+                                    const char *label) {
+  int busy_attempts = 0;
+  while (!should_stop_requested()) {
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+      const char *title_id = (const char *)sqlite3_column_text(stmt, 0);
+      if (!append_app_db_title(list, title_id)) {
+        log_debug("  [DB] %s allocation failed", label);
+        sqlite3_finalize(stmt);
+        close_app_db();
+        free_app_db_title_list(list);
+        return false;
+      }
+      continue;
+    }
+    if (rc == SQLITE_DONE) {
+      sqlite3_finalize(stmt);
+      close_app_db();
+      return true;
+    }
+    if ((rc == SQLITE_BUSY || rc == SQLITE_LOCKED) &&
+        busy_attempts + 1 < APP_DB_QUERY_BUSY_RETRIES) {
+      busy_attempts++;
+      sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
+      continue;
+    }
+
+    log_debug("  [DB] %s query failed: rc=%d err=%s", label, rc,
+              sqlite3_errmsg(g_app_db));
+    sqlite3_finalize(stmt);
+    close_app_db();
+    free_app_db_title_list(list);
+    return false;
+  }
+
+  sqlite3_finalize(stmt);
+  close_app_db();
+  free_app_db_title_list(list);
+  return false;
+}
+
 static bool load_app_db_title_list(struct AppDbTitleList *list) {
   free_app_db_title_list(list);
 
@@ -363,52 +412,62 @@ static bool load_app_db_title_list(struct AppDbTitleList *list) {
   if (prep_rc != SQLITE_OK)
     return false;
 
-  int busy_attempts = 0;
-  while (!should_stop_requested()) {
-    int rc = sqlite3_step(stmt);
-    if (rc == SQLITE_ROW) {
-      const char *title_id = (const char *)sqlite3_column_text(stmt, 0);
-      if (!append_app_db_title(list, title_id)) {
-        log_debug("  [DB] title list allocation failed");
-        sqlite3_finalize(stmt);
-        close_app_db();
-        free_app_db_title_list(list);
-        return false;
-      }
-      continue;
-    }
-    if (rc == SQLITE_DONE) {
-      sqlite3_finalize(stmt);
-      close_app_db();
-      log_debug("  [DB] loaded app.db title list: %d entries", list->count);
-      return true;
-    }
-    if ((rc == SQLITE_BUSY || rc == SQLITE_LOCKED) &&
-        busy_attempts + 1 < APP_DB_QUERY_BUSY_RETRIES) {
-      busy_attempts++;
-      sceKernelUsleep(APP_DB_BUSY_RETRY_SLEEP_US);
-      continue;
-    }
+  bool loaded = step_app_db_title_query(list, stmt, "title list");
+  if (loaded)
+    log_debug("  [DB] loaded app.db title list: %d entries", list->count);
+  return loaded;
+}
 
-    log_debug("  [DB] title list query failed: rc=%d err=%s", rc,
-              sqlite3_errmsg(g_app_db));
-    sqlite3_finalize(stmt);
-    close_app_db();
-    free_app_db_title_list(list);
-    return false;
-  }
-
-  sqlite3_finalize(stmt);
-  close_app_db();
+static bool load_app_db_blocked_uninstall_ppsa_list(struct AppDbTitleList *list) {
   free_app_db_title_list(list);
-  return false;
+
+  const char *sql =
+      "SELECT DISTINCT titleId "
+      "FROM tbl_contentinfo "
+      "WHERE titleId LIKE 'PPSA%' "
+      "AND uninstallable = 0 "
+      "ORDER BY titleId;";
+  sqlite3_stmt *stmt = NULL;
+  int prep_rc =
+      app_db_prepare_with_retry(sql, &stmt, APP_DB_PREPARE_BUSY_RETRIES,
+                                "blocked PPSA uninstallable query");
+  if (prep_rc != SQLITE_OK)
+    return false;
+
+  bool loaded = step_app_db_title_query(list, stmt, "blocked PPSA uninstall");
+  if (loaded)
+    log_debug("  [DB] loaded blocked PPSA uninstall list: %d entries",
+              list->count);
+  return loaded;
 }
 
 void invalidate_app_db_title_cache(void) {
   pthread_mutex_lock(&g_app_db_mutex);
   g_app_db_title_cache_ready = false;
+  g_app_db_blocked_uninstall_ppsa_cache_ready = false;
   g_app_db_title_cache_mtime = 0;
+  g_app_db_blocked_uninstall_ppsa_cache_mtime = 0;
   pthread_mutex_unlock(&g_app_db_mutex);
+}
+
+static bool copy_app_db_title_list(struct AppDbTitleList *dst,
+                                   const struct AppDbTitleList *src) {
+  if (!dst || !src)
+    return false;
+
+  free_app_db_title_list(dst);
+  if (src->count <= 0)
+    return true;
+
+  char(*ids)[MAX_TITLE_ID] = malloc((size_t)src->count * sizeof(*ids));
+  if (!ids)
+    return false;
+
+  memcpy(ids, src->ids, (size_t)src->count * sizeof(*ids));
+  dst->ids = ids;
+  dst->count = src->count;
+  dst->capacity = src->count;
+  return true;
 }
 
 bool get_app_db_title_list_cached(struct AppDbTitleList *list_out) {
@@ -438,21 +497,42 @@ bool get_app_db_title_list_cached(struct AppDbTitleList *list_out) {
     }
   }
 
-  bool copied = true;
-  if (g_app_db_title_cache.count > 0) {
-    char(*ids)[MAX_TITLE_ID] =
-        malloc((size_t)g_app_db_title_cache.count * sizeof(*ids));
-    if (ids) {
-      memcpy(ids, g_app_db_title_cache.ids,
-             (size_t)g_app_db_title_cache.count * sizeof(*ids));
-      list_out->ids = ids;
-      list_out->count = g_app_db_title_cache.count;
-      list_out->capacity = g_app_db_title_cache.count;
+  bool copied = copy_app_db_title_list(list_out, &g_app_db_title_cache);
+  pthread_mutex_unlock(&g_app_db_mutex);
+  return copied;
+}
+
+bool get_app_db_blocked_uninstall_ppsa_list(struct AppDbTitleList *list_out) {
+  if (!list_out)
+    return false;
+
+  free_app_db_title_list(list_out);
+  pthread_mutex_lock(&g_app_db_mutex);
+
+  struct stat st;
+  int app_db_stat_rc = stat(APP_DB_PATH, &st);
+
+  if (!g_app_db_blocked_uninstall_ppsa_cache_ready ||
+      (app_db_stat_rc == 0 &&
+       g_app_db_blocked_uninstall_ppsa_cache_mtime != st.st_mtime)) {
+    struct AppDbTitleList fresh = {0};
+    if (app_db_stat_rc == 0 &&
+        load_app_db_blocked_uninstall_ppsa_list(&fresh)) {
+      free_app_db_title_list(&g_app_db_blocked_uninstall_ppsa_cache);
+      g_app_db_blocked_uninstall_ppsa_cache = fresh;
+      g_app_db_blocked_uninstall_ppsa_cache_mtime = st.st_mtime;
+      g_app_db_blocked_uninstall_ppsa_cache_ready = true;
     } else {
-      copied = false;
+      free_app_db_title_list(&fresh);
+      if (!g_app_db_blocked_uninstall_ppsa_cache_ready) {
+        pthread_mutex_unlock(&g_app_db_mutex);
+        return false;
+      }
     }
   }
 
+  bool loaded =
+      copy_app_db_title_list(list_out, &g_app_db_blocked_uninstall_ppsa_cache);
   pthread_mutex_unlock(&g_app_db_mutex);
-  return copied;
+  return loaded;
 }

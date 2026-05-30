@@ -23,8 +23,10 @@
 typedef struct {
   char discovered_param_roots[MAX_PENDING][MAX_PATH];
   char checked_appmeta_titles[MAX_PENDING][MAX_TITLE_ID];
+  char blocked_ppsa_uninstall_titles[MAX_PENDING][MAX_TITLE_ID];
   bool checked_appmeta_present[MAX_PENDING];
   int checked_appmeta_count;
+  int blocked_ppsa_uninstall_count;
 } scan_workspace_t;
 
 // Reuse the largest transient scan buffer instead of placing ~512 KiB of path
@@ -33,6 +35,62 @@ static scan_workspace_t g_scan_workspace;
 
 static void reset_scan_workspace(void) {
   g_scan_workspace.checked_appmeta_count = 0;
+  g_scan_workspace.blocked_ppsa_uninstall_count = 0;
+}
+
+static bool blocked_ppsa_uninstall_requested(const char *title_id) {
+  if (!title_id || title_id[0] == '\0')
+    return false;
+
+  for (int i = 0; i < g_scan_workspace.blocked_ppsa_uninstall_count; i++) {
+    if (strcmp(g_scan_workspace.blocked_ppsa_uninstall_titles[i], title_id) == 0)
+      return true;
+  }
+  return false;
+}
+
+static void remember_blocked_ppsa_uninstall(const char *title_id) {
+  if (!title_id || title_id[0] == '\0' ||
+      blocked_ppsa_uninstall_requested(title_id))
+    return;
+
+  if (g_scan_workspace.blocked_ppsa_uninstall_count >= MAX_PENDING)
+    return;
+
+  int slot = g_scan_workspace.blocked_ppsa_uninstall_count++;
+  (void)strlcpy(g_scan_workspace.blocked_ppsa_uninstall_titles[slot], title_id,
+                sizeof(g_scan_workspace.blocked_ppsa_uninstall_titles[slot]));
+}
+
+static bool is_blocked_ppsa_title(
+    const struct AppDbTitleList *blocked_ppsa_titles,
+    bool blocked_ppsa_titles_ready, const char *title_id) {
+  return blocked_ppsa_titles_ready &&
+         app_db_title_list_contains(blocked_ppsa_titles, title_id);
+}
+
+static void request_blocked_ppsa_uninstall(const char *title_id,
+                                           const char *source_path) {
+  if (!title_id || title_id[0] == '\0' ||
+      blocked_ppsa_uninstall_requested(title_id))
+    return;
+
+  int res = sceAppInstUtilAppUnInstall(title_id);
+  if (res == 0) {
+    remember_blocked_ppsa_uninstall(title_id);
+    sm_install_forget_pending_title(title_id);
+    invalidate_app_db_title_cache();
+    if (source_path && source_path[0] != '\0') {
+      log_debug("  [REG] requested blocked PPSA uninstall: %s source=%s",
+                title_id, source_path);
+    } else {
+      log_debug("  [REG] requested blocked PPSA uninstall: %s", title_id);
+    }
+    return;
+  }
+
+  log_debug("  [REG] blocked PPSA uninstall failed: %s code=0x%08X", title_id,
+            (uint32_t)res);
 }
 
 static bool get_appmeta_present_for_scan_cycle(const char *title_id) {
@@ -83,6 +141,13 @@ typedef enum {
   EXISTING_DIRECTORY_PREFER_CURRENT,
   EXISTING_DIRECTORY_PREFER_CACHED,
 } existing_directory_result_t;
+
+typedef struct {
+  const struct AppDbTitleList *titles;
+  const struct AppDbTitleList *blocked_ppsa_titles;
+  bool titles_ready;
+  bool blocked_ppsa_titles_ready;
+} scan_app_db_context_t;
 
 static directory_candidate_probe_t probe_directory_candidate(
     const char *full_path, char discovered_param_roots[][MAX_PATH],
@@ -165,8 +230,8 @@ static void notify_duplicate_scan_candidate(const char *title_id,
 }
 
 static existing_directory_result_t handle_existing_directory_candidate(
-    const char *full_path, const struct AppDbTitleList *app_db_titles,
-    bool app_db_titles_ready, const directory_candidate_info_t *info,
+    const char *full_path, const scan_app_db_context_t *app_db,
+    const directory_candidate_info_t *info,
     bool *installed_out, bool *in_app_db_out,
     char preferred_existing_path_out[MAX_PATH]) {
   char tracked_path[MAX_PATH];
@@ -176,7 +241,14 @@ static existing_directory_result_t handle_existing_directory_candidate(
   bool link_matches_source =
       has_tracked_path && strcmp(tracked_path, full_path) == 0;
 
-  if (!app_db_titles_ready) {
+  if (is_blocked_ppsa_title(app_db->blocked_ppsa_titles,
+                            app_db->blocked_ppsa_titles_ready,
+                            info->title_id)) {
+    request_blocked_ppsa_uninstall(info->title_id, full_path);
+    return EXISTING_DIRECTORY_HANDLED;
+  }
+
+  if (!app_db->titles_ready) {
     if (link_matches_source && is_data_mounted(info->title_id)) {
       cache_game_entry(full_path, info->title_id, info->title_name);
       return EXISTING_DIRECTORY_PREFER_CURRENT;
@@ -184,7 +256,7 @@ static existing_directory_result_t handle_existing_directory_candidate(
     return EXISTING_DIRECTORY_HANDLED;
   }
 
-  bool in_app_db = app_db_title_list_contains(app_db_titles, info->title_id);
+  bool in_app_db = app_db_title_list_contains(app_db->titles, info->title_id);
   bool installed = in_app_db && is_installed(info->title_id);
   bool appmeta_present =
       installed ? get_appmeta_present_for_scan_cycle(info->title_id) : false;
@@ -274,8 +346,8 @@ static bool enqueue_directory_candidate(
 
 static bool try_collect_candidate_for_directory(
     const char *full_path, scan_candidate_t *candidates, int max_candidates,
-    int *candidate_count, const struct AppDbTitleList *app_db_titles,
-    bool app_db_titles_ready, char discovered_param_roots[][MAX_PATH],
+    int *candidate_count, const scan_app_db_context_t *app_db,
+    char discovered_param_roots[][MAX_PATH],
     int *discovered_param_root_count, bool allow_known_param_root,
     const char *manual_source_path, bool *unstable_found_out) {
   directory_candidate_info_t info;
@@ -300,8 +372,7 @@ static bool try_collect_candidate_for_directory(
   bool in_app_db = false;
   char preferred_existing_path[MAX_PATH];
   existing_directory_result_t existing_result =
-      handle_existing_directory_candidate(full_path, app_db_titles,
-                                          app_db_titles_ready, &info,
+      handle_existing_directory_candidate(full_path, app_db, &info,
                                           &installed, &in_app_db,
                                           preferred_existing_path);
   if (existing_result == EXISTING_DIRECTORY_PREFER_CURRENT) {
@@ -354,8 +425,7 @@ typedef struct {
   scan_candidate_t *candidates;
   int max_candidates;
   int *candidate_count;
-  const struct AppDbTitleList *app_db_titles;
-  bool app_db_titles_ready;
+  const scan_app_db_context_t *app_db;
   char (*discovered_param_roots)[MAX_PATH];
   int *discovered_param_root_count;
   const char *manual_source_path;
@@ -370,9 +440,9 @@ static sm_scan_tree_dir_visit_t collect_candidate_directory_visit(
   collect_candidates_walk_ctx_t *ctx = (collect_candidates_walk_ctx_t *)ctx_ptr;
   if (try_collect_candidate_for_directory(
           dir_path, ctx->candidates, ctx->max_candidates, ctx->candidate_count,
-          ctx->app_db_titles, ctx->app_db_titles_ready,
-          ctx->discovered_param_roots, ctx->discovered_param_root_count,
-          false, ctx->manual_source_path, ctx->unstable_found_out)) {
+          ctx->app_db, ctx->discovered_param_roots,
+          ctx->discovered_param_root_count, false, ctx->manual_source_path,
+          ctx->unstable_found_out)) {
     return SM_SCAN_TREE_DIR_SKIP_DESCEND;
   }
 
@@ -393,7 +463,7 @@ static bool collect_candidate_image_visit(const char *image_path,
 static void collect_scan_candidates_from_manual_root(
     const char *scan_path, const char *manual_source_path,
     scan_candidate_t *candidates, int max_candidates, int *candidate_count,
-    const struct AppDbTitleList *app_db_titles, bool app_db_titles_ready,
+    const scan_app_db_context_t *app_db,
     char discovered_param_roots[][MAX_PATH], int *discovered_param_root_count,
     bool *unstable_found_out) {
   if (should_stop_requested() || runtime_sleep_mode_active())
@@ -408,9 +478,8 @@ static void collect_scan_candidates_from_manual_root(
   if (try_root_candidate) {
     if (try_collect_candidate_for_directory(
             scan_path, candidates, max_candidates, candidate_count,
-            app_db_titles, app_db_titles_ready, discovered_param_roots,
-            discovered_param_root_count, true, manual_source_path,
-            unstable_found_out)) {
+            app_db, discovered_param_roots, discovered_param_root_count, true,
+            manual_source_path, unstable_found_out)) {
       return;
     }
   }
@@ -423,8 +492,7 @@ static void collect_scan_candidates_from_manual_root(
       .candidates = candidates,
       .max_candidates = max_candidates,
       .candidate_count = candidate_count,
-      .app_db_titles = app_db_titles,
-      .app_db_titles_ready = app_db_titles_ready,
+      .app_db = app_db,
       .discovered_param_roots = discovered_param_roots,
       .discovered_param_root_count = discovered_param_root_count,
       .manual_source_path = manual_source_path,
@@ -439,8 +507,8 @@ static void collect_scan_candidates_from_manual_root(
 
 static void collect_scan_candidates_from_manual_path(
     const char *manual_path, scan_candidate_t *candidates, int max_candidates,
-    int *candidate_count, const struct AppDbTitleList *app_db_titles,
-    bool app_db_titles_ready, char discovered_param_roots[][MAX_PATH],
+    int *candidate_count, const scan_app_db_context_t *app_db,
+    char discovered_param_roots[][MAX_PATH],
     int *discovered_param_root_count, bool *unstable_found_out) {
   if (should_stop_requested() || runtime_sleep_mode_active())
     return;
@@ -462,8 +530,8 @@ static void collect_scan_candidates_from_manual_path(
     get_image_mount_point_for_source(manual_path, mount_point);
     collect_scan_candidates_from_manual_root(
         mount_point, manual_path, candidates, max_candidates, candidate_count,
-        app_db_titles, app_db_titles_ready, discovered_param_roots,
-        discovered_param_root_count, unstable_found_out);
+        app_db, discovered_param_roots, discovered_param_root_count,
+        unstable_found_out);
     return;
   }
 
@@ -476,16 +544,15 @@ static void collect_scan_candidates_from_manual_path(
 
   collect_scan_candidates_from_manual_root(
       manual_path, manual_path, candidates, max_candidates, candidate_count,
-      app_db_titles, app_db_titles_ready, discovered_param_roots,
-      discovered_param_root_count, unstable_found_out);
+      app_db, discovered_param_roots, discovered_param_root_count,
+      unstable_found_out);
 }
 
 typedef struct {
   scan_candidate_t *candidates;
   int max_candidates;
   int *candidate_count;
-  const struct AppDbTitleList *app_db_titles;
-  bool app_db_titles_ready;
+  const scan_app_db_context_t *app_db;
   char (*discovered_param_roots)[MAX_PATH];
   int *discovered_param_root_count;
   bool *unstable_found_out;
@@ -505,9 +572,8 @@ static bool collect_manual_path_visit(const char *manual_path, void *ctx_ptr) {
   ctx->path_count++;
   collect_scan_candidates_from_manual_path(
       manual_path, ctx->candidates, ctx->max_candidates, ctx->candidate_count,
-      ctx->app_db_titles, ctx->app_db_titles_ready,
-      ctx->discovered_param_roots, ctx->discovered_param_root_count,
-      ctx->unstable_found_out);
+      ctx->app_db, ctx->discovered_param_roots,
+      ctx->discovered_param_root_count, ctx->unstable_found_out);
   return true;
 }
 
@@ -653,8 +719,8 @@ void unmount_usb_sources_for_suspend(void) {
 
 static void collect_scan_candidates_from_root(
     const char *scan_path, scan_candidate_t *candidates, int max_candidates,
-    int *candidate_count, const struct AppDbTitleList *app_db_titles,
-    bool app_db_titles_ready, char discovered_param_roots[][MAX_PATH],
+    int *candidate_count, const scan_app_db_context_t *app_db,
+    char discovered_param_roots[][MAX_PATH],
     int *discovered_param_root_count, bool *unstable_found_out) {
   if (should_stop_requested() || runtime_sleep_mode_active())
     return;
@@ -667,8 +733,7 @@ static void collect_scan_candidates_from_root(
       .candidates = candidates,
       .max_candidates = max_candidates,
       .candidate_count = candidate_count,
-      .app_db_titles = app_db_titles,
-      .app_db_titles_ready = app_db_titles_ready,
+      .app_db = app_db,
       .discovered_param_roots = discovered_param_roots,
       .discovered_param_root_count = discovered_param_root_count,
       .manual_source_path = NULL,
@@ -683,20 +748,20 @@ static void collect_scan_candidates_from_root(
 
 static void collect_scan_candidates_from_manual_list(
     scan_candidate_t *candidates, int max_candidates, int *candidate_count,
-    const struct AppDbTitleList *app_db_titles, bool app_db_titles_ready,
+    const scan_app_db_context_t *app_db,
     char discovered_param_roots[][MAX_PATH], int *discovered_param_root_count,
     bool *unstable_found_out) {
   if (should_stop_requested() || runtime_sleep_mode_active())
     return;
 
-  (void)sm_manual_reconcile_deleted_titles(app_db_titles, app_db_titles_ready);
+  (void)sm_manual_reconcile_deleted_titles(app_db->titles,
+                                           app_db->titles_ready);
 
   manual_scan_ctx_t ctx = {
       .candidates = candidates,
       .max_candidates = max_candidates,
       .candidate_count = candidate_count,
-      .app_db_titles = app_db_titles,
-      .app_db_titles_ready = app_db_titles_ready,
+      .app_db = app_db,
       .discovered_param_roots = discovered_param_roots,
       .discovered_param_root_count = discovered_param_root_count,
       .unstable_found_out = unstable_found_out,
@@ -710,6 +775,24 @@ static void collect_scan_candidates_from_manual_list(
   log_debug("  [MANUAL] scanned %d manual source(s)", ctx.path_count);
 }
 
+static void uninstall_blocked_ppsa_titles(
+    const struct AppDbTitleList *blocked_ppsa_titles,
+    bool blocked_ppsa_titles_ready) {
+  if (!blocked_ppsa_titles_ready || !blocked_ppsa_titles)
+    return;
+
+  int requested_before = g_scan_workspace.blocked_ppsa_uninstall_count;
+  for (int i = 0; i < blocked_ppsa_titles->count &&
+                  !should_stop_requested() && !runtime_sleep_mode_active();
+       i++) {
+    request_blocked_ppsa_uninstall(blocked_ppsa_titles->ids[i], NULL);
+  }
+
+  int requested = g_scan_workspace.blocked_ppsa_uninstall_count - requested_before;
+  if (requested > 0)
+    log_debug("  [REG] requested %d blocked PPSA uninstall(s)", requested);
+}
+
 int collect_scan_candidates_for_scan_root(const char *scan_root,
                                           scan_candidate_t *candidates,
                                           int max_candidates,
@@ -718,21 +801,32 @@ int collect_scan_candidates_for_scan_root(const char *scan_root,
   reset_scan_workspace();
   int candidate_count = 0;
   struct AppDbTitleList app_db_titles = {0};
+  struct AppDbTitleList blocked_ppsa_titles = {0};
   bool app_db_titles_ready = get_app_db_title_list_cached(&app_db_titles);
+  bool blocked_ppsa_titles_ready =
+      get_app_db_blocked_uninstall_ppsa_list(&blocked_ppsa_titles);
   int discovered_param_root_count = 0;
 
   if (!app_db_titles_ready)
     log_debug("  [DB] app.db title list unavailable for this scan cycle");
+  if (!blocked_ppsa_titles_ready)
+    log_debug("  [DB] blocked PPSA uninstall list unavailable for this scan cycle");
 
+  scan_app_db_context_t app_db = {
+      .titles = &app_db_titles,
+      .blocked_ppsa_titles = &blocked_ppsa_titles,
+      .titles_ready = app_db_titles_ready,
+      .blocked_ppsa_titles_ready = blocked_ppsa_titles_ready,
+  };
   collect_scan_candidates_from_root(scan_root, candidates, max_candidates,
-                                    &candidate_count, &app_db_titles,
-                                    app_db_titles_ready,
+                                    &candidate_count, &app_db,
                                     g_scan_workspace.discovered_param_roots,
                                     &discovered_param_root_count,
                                     unstable_found_out);
 
   if (total_found_out)
     *total_found_out = discovered_param_root_count;
+  free_app_db_title_list(&blocked_ppsa_titles);
   free_app_db_title_list(&app_db_titles);
   return candidate_count;
 }
@@ -743,31 +837,45 @@ int collect_scan_candidates(scan_candidate_t *candidates, int max_candidates,
   reset_scan_workspace();
   int candidate_count = 0;
   struct AppDbTitleList app_db_titles = {0};
+  struct AppDbTitleList blocked_ppsa_titles = {0};
   bool app_db_titles_ready = get_app_db_title_list_cached(&app_db_titles);
+  bool blocked_ppsa_titles_ready =
+      get_app_db_blocked_uninstall_ppsa_list(&blocked_ppsa_titles);
   int discovered_param_root_count = 0;
 
   if (!app_db_titles_ready)
     log_debug("  [DB] app.db title list unavailable for this scan cycle");
+  if (!blocked_ppsa_titles_ready)
+    log_debug("  [DB] blocked PPSA uninstall list unavailable for this scan cycle");
 
+  scan_app_db_context_t app_db = {
+      .titles = &app_db_titles,
+      .blocked_ppsa_titles = &blocked_ppsa_titles,
+      .titles_ready = app_db_titles_ready,
+      .blocked_ppsa_titles_ready = blocked_ppsa_titles_ready,
+  };
   for (int i = 0; i < get_scan_path_count(); i++) {
     if (should_stop_requested() || runtime_sleep_mode_active())
       break;
     collect_scan_candidates_from_root(get_scan_path(i), candidates,
                                       max_candidates,
-                                      &candidate_count,
-                                      &app_db_titles, app_db_titles_ready,
+                                      &candidate_count, &app_db,
                                       g_scan_workspace.discovered_param_roots,
                                       &discovered_param_root_count,
                                       unstable_found_out);
   }
 
   collect_scan_candidates_from_manual_list(
-      candidates, max_candidates, &candidate_count, &app_db_titles,
-      app_db_titles_ready, g_scan_workspace.discovered_param_roots,
-      &discovered_param_root_count, unstable_found_out);
+      candidates, max_candidates, &candidate_count, &app_db,
+      g_scan_workspace.discovered_param_roots, &discovered_param_root_count,
+      unstable_found_out);
+
+  uninstall_blocked_ppsa_titles(&blocked_ppsa_titles,
+                                blocked_ppsa_titles_ready);
 
   if (total_found_out)
     *total_found_out = discovered_param_root_count;
+  free_app_db_title_list(&blocked_ppsa_titles);
   free_app_db_title_list(&app_db_titles);
   return candidate_count;
 }
