@@ -69,15 +69,15 @@ static bool is_blocked_ppsa_title(
          app_db_title_list_contains(blocked_ppsa_titles, title_id);
 }
 
-static void request_blocked_ppsa_uninstall(const char *title_id,
+static bool request_blocked_ppsa_uninstall(const char *title_id,
                                            const char *source_path) {
   if (!title_id || title_id[0] == '\0' ||
       blocked_ppsa_uninstall_requested(title_id))
-    return;
+    return false;
 
+  remember_blocked_ppsa_uninstall(title_id);
   int res = sceAppInstUtilAppUnInstall(title_id);
   if (res == 0) {
-    remember_blocked_ppsa_uninstall(title_id);
     sm_install_forget_pending_title(title_id);
     invalidate_app_db_title_cache();
     if (source_path && source_path[0] != '\0') {
@@ -86,11 +86,12 @@ static void request_blocked_ppsa_uninstall(const char *title_id,
     } else {
       log_debug("  [REG] requested blocked PPSA uninstall: %s", title_id);
     }
-    return;
+    return true;
   }
 
   log_debug("  [REG] blocked PPSA uninstall failed: %s code=0x%08X", title_id,
             (uint32_t)res);
+  return false;
 }
 
 static bool get_appmeta_present_for_scan_cycle(const char *title_id) {
@@ -781,14 +782,15 @@ static void uninstall_blocked_ppsa_titles(
   if (!blocked_ppsa_titles_ready || !blocked_ppsa_titles)
     return;
 
-  int requested_before = g_scan_workspace.blocked_ppsa_uninstall_count;
+  int requested = 0;
   for (int i = 0; i < blocked_ppsa_titles->count &&
                   !should_stop_requested() && !runtime_sleep_mode_active();
        i++) {
-    request_blocked_ppsa_uninstall(blocked_ppsa_titles->ids[i], NULL);
+    const char *title_id = blocked_ppsa_titles->ids[i];
+    if (request_blocked_ppsa_uninstall(title_id, NULL))
+      requested++;
   }
 
-  int requested = g_scan_workspace.blocked_ppsa_uninstall_count - requested_before;
   if (requested > 0)
     log_debug("  [REG] requested %d blocked PPSA uninstall(s)", requested);
 }
