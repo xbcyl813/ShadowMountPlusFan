@@ -1424,6 +1424,21 @@ static config_load_status_t load_runtime_config_state(runtime_config_state_t *st
       continue;
     }
 
+     // ====== 【风扇守护：注入原厂 INI 参数拦截流】 ======
+        if (strcasecmp(key, "target_temp") == 0) {
+            // 调用原生安全解析函数 parse_u32_ini，自动去换行与去空格
+            if (!parse_u32_ini(value, &u32) || u32 < 60u || u32 > 79u) {
+                // 如果用户在 INI 文件里改错了数字或超出了安全范围，打印调试日志并用 75 度保底
+                log_debug(" [CFG] invalid fan target temp at line %d: %s=%s (range: 60..79), forcing 75C", line_no, key, value);
+                state->cfg.target_temp = 75u;
+            } else {
+                // 校验成功，无缝存入原厂结构体新成员中，100% 闭合
+                state->cfg.target_temp = u32;
+            }
+            continue; // 拦截成功后直接跳过本行，防止其滚入下方的 "unknown key" 报错和日志中
+        }
+        // =======================================================================
+    
     bool is_sector_key =
         (strcasecmp(key, "lvd_exfat_sector_size") == 0) ||
         (strcasecmp(key, "lvd_ufs_sector_size") == 0) ||
