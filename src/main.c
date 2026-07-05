@@ -69,7 +69,6 @@ static uint8_t g_fan_target_temp = 75;
 static void force_write_fan_register(uint8_t target_temp) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
-        // 【检查重点】：确保此处为 char data[] 数组形式，否则在某些严格编译器下也会触发 Scalar 警告
         char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
         ioctl(fan_fd, 0xC01C8F07, data); 
         close(fan_fd); 
@@ -501,44 +500,7 @@ int main(void) {
     log_debug("  [SHELLFLAG] monitor unavailable");
   sm_mdbg_init();
   sm_kstuff_init();
-
-   // ==================== 【风扇冷启动读取配置与初次注入】 ====================
-    sceKernelUsleep(2000000u); // 转换前等待 2 秒
-
-    // 开机时读取一次硬盘配置文件 fan.cfg，将其缓存在全局内存变量 g_fan_target_temp 中
-   int config_fd = open("/data/fan.cfg", 0, 0); // O_RDONLY
-    if (config_fd > 0) {
-        char config_buf[16] = {0}; 
-        int bytes_read = read(config_fd, config_buf, 15);
-        close(config_fd);
-        
-        if (bytes_read > 0) {
-            int parsed_temp = 0;
-            if (sscanf(config_buf, "%d", &parsed_temp) == 1) {
-                // 风扇温度控制阈值范围限制在 60 到 79 度
-                if (parsed_temp >= 60 && parsed_temp <= 79) {
-                    g_fan_target_temp = (uint8_t)parsed_temp;
-                }
-            }
-        }
-    } else {
-        // 【终极闭环】：由于此时越狱已完成，直接以 O_WRONLY | O_CREAT 强行无阻碍创建文件
-        // 0x0002 代表 O_WRONLY，0x0200 代表 O_CREAT，0666 为标准 FreeBSD 文件权限
-        int create_fd = open("/data/fan.cfg", 0x0002 | 0x0200, 0666);
-        if (create_fd > 0) {
-            // 直接采用纯粹的 3 字节标准字符流 "75\n"（不带任何干扰 LLVM 优化的 \0 标量）
-            const char default_text[3] = {'7', '5', '\n'};
-            write(create_fd, default_text, 3);
-            close(create_fd);
-            log_debug("[FAN] Custom config missing. Successfully auto-created /data/fan.cfg with 75C.");
-        }
-    }
-
-   // 初次写入寄存器让风扇生效
-    force_write_fan_register(g_fan_target_temp);
-    notify_system("Fan Threshold Set to %d°C!", (int)g_fan_target_temp);
-    sceKernelUsleep(2000000u); // 转换后等待 2 秒
-  
+   
   if (!refresh_game_lifecycle_watcher())
     log_debug("  [GAME] lifecycle watcher unavailable");
 
