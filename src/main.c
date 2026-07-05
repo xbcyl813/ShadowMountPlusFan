@@ -61,6 +61,8 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
+void force_write_fan_register_from_config(void);
+
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
@@ -71,7 +73,7 @@ static void force_write_fan_register(uint8_t target_temp) {
     }
 }
 
-// 供外部独立线程事件源被动调用的标准安全包装函数
+// 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
     uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
                                  (uint8_t)runtime_config()->target_temp : 75;
