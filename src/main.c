@@ -3,7 +3,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/sysctl.h>
-#include <time.h> // 引入时间库用于精准计时
 
 #include "sm_runtime.h"
 #include "sm_types.h"
