@@ -102,6 +102,8 @@ bool should_stop_requested(void) {
     // 该检测函数被后台高频触发，计满约 100 次（约 10 秒）自动在内存中强制重新冲刷一次南桥硬件
     // 索尼在启动游戏、返回主菜单、或待机苏醒瞬间下发的任何风扇重置，都会直接被强行覆盖回来
     if (fan_loop_counter >= 100) {
+       uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
+                                     (uint8_t)runtime_config()->target_temp : 75;
         force_write_fan_register(g_fan_target_temp);
         fan_loop_counter = 0; // 重置计数器
     }
