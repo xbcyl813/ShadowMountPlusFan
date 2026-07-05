@@ -476,6 +476,9 @@ int main(void) {
     // ==================== 【插入的风扇控制核心自举模块】 ====================
    uint8_t THRESHOLDTEMP = 65; //默认温度阈值改为 65 度
 
+   // 在修改风扇转速之前，显式让线程挂起 2 秒钟，等待系统内核和 SMC 硬件状态完全稳定
+    sceKernelUsleep(2000000u);
+
     // 1. 本地安全读取自定义配置文件 fan.cfg
     int config_fd = open("/data/fan.cfg", O_RDONLY, 0);
     if (config_fd > 0) {
@@ -505,6 +508,9 @@ int main(void) {
 
     // 3. 借用项目的 notify_system 引擎，在屏幕右上角弹窗提示   
     notify_system("Fan Threshold Set to %d°C!", (int)THRESHOLDTEMP);
+
+    // 在成功修改风扇转速之后，再次等待 2 秒钟，确保南桥 SMC 物理变频逻辑安全闭环
+    sceKernelUsleep(2000000u);
   
   if (!refresh_game_lifecycle_watcher())
     log_debug("  [GAME] lifecycle watcher unavailable");
