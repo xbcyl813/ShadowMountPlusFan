@@ -69,9 +69,10 @@ static uint8_t g_fan_target_temp = 75;
 static void force_write_fan_register(uint8_t target_temp) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
+        // 【检查重点】：确保此处为 char data[] 数组形式，否则在某些严格编译器下也会触发 Scalar 警告
         char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
         ioctl(fan_fd, 0xC01C8F07, data); 
-        close(fan_fd);
+        close(fan_fd); 
     }
 }
 
@@ -505,9 +506,10 @@ int main(void) {
     sceKernelUsleep(2000000u); // 转换前等待 2 秒
 
     // 开机时读取一次硬盘配置文件 fan.cfg，将其缓存在全局内存变量 g_fan_target_temp 中
-    int config_fd = open("/data/fan.cfg", 0, 0); // O_RDONLY
+     int config_fd = open("/data/fan.cfg", 0, 0); // O_RDONLY
     if (config_fd > 0) {
-        char config_buf = {0};
+        // 【核心修正】：开辟 16 字节的标准字符数组缓冲区，并将其完全清零
+        char config_buf[16] = {0}; 
         int bytes_read = read(config_fd, config_buf, 15);
         close(config_fd);
         
@@ -521,11 +523,11 @@ int main(void) {
             }
         }
     } else {
-        // 如果文件不存在（config_fd <= 0），则自动创建并写入默认的 75 度
+        // 如果文件不存在，则自动创建并写入默认的 75 度
         // 0x0002 代表 O_WRONLY，0x0200 代表 O_CREAT，0666 为标准 FreeBSD 文件读写权限
         int create_fd = open("/data/fan.cfg", 0x0002 | 0x0200, 0666);
         if (create_fd > 0) {
-            // 将 75 数字格式化为 2 字节纯文本字符串 "75"
+            // 将 75 数字格式化为 3 字节纯文本字符串 "75\n"
             char default_data[] = {'7', '5', '\n', '\0'};
             write(create_fd, default_data, 3);
             close(create_fd);
