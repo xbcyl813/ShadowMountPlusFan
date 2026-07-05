@@ -145,5 +145,5 @@
 ## scanpath=/data/homebrew
 ## scanpath=/data/etaHEN/games
 
-#[FanControl] 风扇自定义守护温控参数，默认75度"
+#[FanControl] default 75°C
 #target_temp = 75
