@@ -473,6 +473,39 @@ int main(void) {
     log_debug("  [SHELLFLAG] monitor unavailable");
   sm_mdbg_init();
   sm_kstuff_init();
+    // ==================== 【插入的风扇控制核心自举模块】 ====================
+   uint8_t THRESHOLDTEMP = 65; //默认温度阈值改为 65 度
+
+    // 1. 本地安全读取自定义配置文件 fan.cfg
+    int config_fd = open("/data/fan.cfg", O_RDONLY, 0);
+    if (config_fd > 0) {
+        char config_buf[16] = {0};
+        int bytes_read = read(config_fd, config_buf, 15);
+        close(config_fd);
+        
+        if (bytes_read > 0) {
+            int parsed_temp = 0;
+            if (sscanf(config_buf, "%d", &parsed_temp) == 1) {
+                // 风扇温度控制阈值范围限定在 60 到 79 度
+                if (parsed_temp >= 60 && parsed_temp <= 79) {
+                    THRESHOLDTEMP = (uint8_t)parsed_temp;
+                }
+            }
+        }
+    }
+
+    // 2. 借壳下发 ioctl，直接写入底层 icc_fan 设备
+    int fan_fd = open("/dev/icc_fan", O_RDONLY, 0);
+    if (fan_fd > 0) {
+        // 完整的 10 字节标准硬件控制流数据包
+        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, THRESHOLDTEMP, 0x00, 0x00, 0x00, 0x00};
+        ioctl(fan_fd, 0xC01C8F07, data); 
+        close(fan_fd);
+    }
+
+    // 3. 借用项目的 notify_system 引擎，在屏幕右上角弹窗提示   
+    notify_system("Fan Threshold Set to %d°C!", (int)THRESHOLDTEMP);
+  
   if (!refresh_game_lifecycle_watcher())
     log_debug("  [GAME] lifecycle watcher unavailable");
 
