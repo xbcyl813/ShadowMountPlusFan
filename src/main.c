@@ -61,6 +61,33 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
+// 风扇温度阈值控制函数
+static void apply_fan_control(void) {
+    uint8_t THRESHOLDTEMP = 65; // 默认 65 度  
+
+    int config_fd = open("/data/fan.cfg", O_RDONLY, 0);
+    if (config_fd > 0) {
+        char config_buf[16] = {0};
+        int bytes_read = read(config_fd, config_buf, 15);
+        close(config_fd);
+        if (bytes_read > 0) {
+            int parsed_temp = 0;
+            if (sscanf(config_buf, "%d", &parsed_temp) == 1) {
+                if (parsed_temp >= 60 && parsed_temp <= 79) {
+                    THRESHOLDTEMP = (uint8_t)parsed_temp;
+                }
+            }
+        }
+    }
+
+    int fan_fd = open("/dev/icc_fan", O_RDONLY, 0);
+    if (fan_fd > 0) {
+        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, THRESHOLDTEMP, 0x00, 0x00, 0x00, 0x00};
+        ioctl(fan_fd, 0xC01C8F07, data); 
+        close(fan_fd);
+    }
+}
+
 static void on_signal(int sig) {
   (void)sig;
   g_stop_requested = 1;
