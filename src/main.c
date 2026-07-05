@@ -3,6 +3,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/sysctl.h>
+#include <time.h> // 引入时间库用于精准计时
 
 #include "sm_runtime.h"
 #include "sm_types.h"
@@ -61,28 +62,14 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
-// 风扇温度阈值控制函数
-static void apply_fan_control(void) {
-    uint8_t THRESHOLDTEMP = 65; // 默认 65 度  
+// 全局内存变量，用来暂存从配置文件读取到的温度，默认保底为 65 度
+static uint8_t g_fan_target_temp = 65;
 
-    int config_fd = open("/data/fan.cfg", O_RDONLY, 0);
-    if (config_fd > 0) {
-        char config_buf[16] = {0};
-        int bytes_read = read(config_fd, config_buf, 15);
-        close(config_fd);
-        if (bytes_read > 0) {
-            int parsed_temp = 0;
-            if (sscanf(config_buf, "%d", &parsed_temp) == 1) {
-                if (parsed_temp >= 60 && parsed_temp <= 79) {
-                    THRESHOLDTEMP = (uint8_t)parsed_temp;
-                }
-            }
-        }
-    }
-
-    int fan_fd = open("/dev/icc_fan", O_RDONLY, 0);
+// 独立的风扇底层写入函数
+static void force_write_fan_register(uint8_t target_temp) {
+    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
-        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, THRESHOLDTEMP, 0x00, 0x00, 0x00, 0x00};
+        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
         ioctl(fan_fd, 0xC01C8F07, data); 
         close(fan_fd);
     }
@@ -107,6 +94,19 @@ void install_signal_handlers(void) {
 }
 
 bool should_stop_requested(void) {
+
+// ====== 【风扇守护修改点：高频反重置定时器守护】 ======
+    static int fan_loop_counter = 0;
+    fan_loop_counter++;
+
+    // 该检测函数被后台高频触发，计满约 100 次（约 10 秒）自动在内存中强制重新冲刷一次南桥硬件
+    // 索尼在启动游戏、返回主菜单、或待机苏醒瞬间下发的任何风扇重置，都会直接被强行覆盖回来
+    if (fan_loop_counter >= 100) {
+        force_write_fan_register(g_fan_target_temp);
+        fan_loop_counter = 0; // 重置计数器
+    }
+// ==========================================================
+  
   if (g_stop_requested)
     return true;
 
@@ -500,44 +500,31 @@ int main(void) {
     log_debug("  [SHELLFLAG] monitor unavailable");
   sm_mdbg_init();
   sm_kstuff_init();
-    // ==================== 【插入的风扇控制核心自举模块】 ====================
-   uint8_t THRESHOLDTEMP = 65; //默认温度阈值改为 65 度
 
-   // 在修改风扇转速之前，显式让线程挂起 2 秒钟，等待系统内核和 SMC 硬件状态完全稳定
-    sceKernelUsleep(2000000u);
+   // ==================== 【风扇冷启动读取配置与初次注入】 ====================
+    sceKernelUsleep(2000000u); // 转换前等待 2 秒
 
-    // 1. 本地安全读取自定义配置文件 fan.cfg
-    int config_fd = open("/data/fan.cfg", O_RDONLY, 0);
+    // 开机时读取一次硬盘配置文件 fan.cfg，将其缓存在全局内存变量 g_fan_target_temp 中
+    int config_fd = open("/data/fan.cfg", 0, 0); // O_RDONLY
     if (config_fd > 0) {
-        char config_buf[16] = {0};
+        char config_buf = {0};
         int bytes_read = read(config_fd, config_buf, 15);
         close(config_fd);
-        
         if (bytes_read > 0) {
             int parsed_temp = 0;
             if (sscanf(config_buf, "%d", &parsed_temp) == 1) {
-                // 风扇温度控制阈值范围限定在 60 到 79 度
+                // 风扇温度控制阈值范围限制在 60 到 79 度
                 if (parsed_temp >= 60 && parsed_temp <= 79) {
-                    THRESHOLDTEMP = (uint8_t)parsed_temp;
+                    g_fan_target_temp = (uint8_t)parsed_temp;
                 }
             }
         }
     }
 
-    // 2. 借壳下发 ioctl，直接写入底层 icc_fan 设备
-    int fan_fd = open("/dev/icc_fan", O_RDONLY, 0);
-    if (fan_fd > 0) {
-        // 完整的 10 字节标准硬件控制流数据包
-        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, THRESHOLDTEMP, 0x00, 0x00, 0x00, 0x00};
-        ioctl(fan_fd, 0xC01C8F07, data); 
-        close(fan_fd);
-    }
-
-    // 3. 借用项目的 notify_system 引擎，在屏幕右上角弹窗提示   
-    notify_system("Fan Threshold Set to %d°C!", (int)THRESHOLDTEMP);
-
-    // 在成功修改风扇转速之后，再次等待 2 秒钟，确保南桥 SMC 物理变频逻辑安全闭环
-    sceKernelUsleep(2000000u);
+   // 初次写入寄存器让风扇生效
+    force_write_fan_register(g_fan_target_temp);
+    notify_system("Fan Threshold Set to %d°C!", (int)g_fan_target_temp);
+    sceKernelUsleep(2000000u); // 转换后等待 2 秒
   
   if (!refresh_game_lifecycle_watcher())
     log_debug("  [GAME] lifecycle watcher unavailable");
