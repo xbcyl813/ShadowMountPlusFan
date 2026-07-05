@@ -131,6 +131,7 @@ typedef struct runtime_config {
   uint32_t lvd_sector_pfs;
   uint32_t md_sector_exfat;
   uint32_t md_sector_ufs;
+  uint32_t target_temp;
 } runtime_config_t;
 
 typedef enum {
