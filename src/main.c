@@ -494,6 +494,24 @@ int main(void) {
   if (restarted_previous_instance)
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
+
+  // ====== 【风扇守护修改点：应用原厂结构体配置温度】 ======
+    sceKernelUsleep(2000000u); // 转换前等待 2 秒
+
+    // 提取原厂已经在 sm_config_mount.c 里解析好的结构体参数
+    // 边界安全校验：为 0 或超出范围时强行用 75 度保护硬件
+    if (runtime_config()->target_temp < 60u || runtime_config()->target_temp > 79u) {
+        force_write_fan_register(75);
+        notify_system("Fan Threshold Set to 75°C (Fallback)!", 75);
+    } else {
+        // 如果文件存在且数字合法，直接提取结构体数值并让风扇变速生效
+        force_write_fan_register((uint8_t)runtime_config()->target_temp);
+        notify_system("Fan Threshold Set to %d°C!", (int)runtime_config()->target_temp);
+    }
+
+    sceKernelUsleep(2000000u); // 转换后等待 2 秒
+    // ==============================================================================
+  
   sm_notifications_init();
   stop_conflicting_backpork();
   if (!sm_shellcore_flags_start())
