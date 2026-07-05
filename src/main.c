@@ -62,14 +62,21 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
-// 独立的风扇底层写入函数
+// 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
         char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
-        ioctl(fan_fd, 0xC01C8F07, data); 
-        close(fan_fd); 
+        ioctl(fan_fd, 0xC01C8F07, data);
+        close(fan_fd);
     }
+}
+
+// 供外部独立线程事件源被动调用的标准安全包装函数
+void force_write_fan_register_from_config(void) {
+    uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
+                                 (uint8_t)runtime_config()->target_temp : 75;
+    force_write_fan_register(current_guard_temp);
 }
 
 static void on_signal(int sig) {
@@ -494,21 +501,11 @@ int main(void) {
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
 
-  // ====== 【风扇守护修改点：应用原厂结构体配置温度】 ======
-    sceKernelUsleep(2000000u); // 转换前等待 2 秒
-
-    // 提取原厂已经在 sm_config_mount.c 里解析好的结构体参数
-    // 边界安全校验：为 0 或超出范围时强行用 75 度保护硬件
-    if (runtime_config()->target_temp < 60u || runtime_config()->target_temp > 79u) {
-        force_write_fan_register(75);
-        notify_system("Fan Threshold Set to 75°C (Fallback)!", 75);
-    } else {
-        // 如果文件存在且数字合法，直接提取结构体数值并让风扇变速生效
-        force_write_fan_register((uint8_t)runtime_config()->target_temp);
-        notify_system("Fan Threshold Set to %d°C!", (int)runtime_config()->target_temp);
-    }
-
-    sceKernelUsleep(2000000u); // 转换后等待 2 秒
+    // ====== 【风扇冷启动初次应用配置】 ======
+    sceKernelUsleep(2000000u);
+    force_write_fan_register_from_config();
+    notify_system("Fan Threshold Set to %d°C!", (int)runtime_config()->target_temp);
+    sceKernelUsleep(2000000u);
     // ==============================================================================
   
   sm_notifications_init();
