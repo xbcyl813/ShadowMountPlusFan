@@ -730,6 +730,12 @@ bool sm_kstuff_game_feature_enabled(void) {
 
 void sm_kstuff_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id,
                             uint64_t exec_time_us) {
+  
+   // ====== 【风扇守护修改点：在自动暂停条件判断前注入风扇控制】 ======
+    extern void force_write_fan_register_from_config(void);
+    force_write_fan_register_from_config();
+    // =========================================================================
+
   if (!sm_kstuff_game_feature_enabled())
     return;
 
@@ -790,6 +796,13 @@ void sm_kstuff_note_app_focus(uint32_t app_id) {
 }
 
 void sm_kstuff_game_on_exit(pid_t pid) {
+  
+   // ====== 【风扇守护修改点：在退出清理条件判断前注入风扇控制】 ======
+    // 退出游戏回到主界面，索尼再次重置风扇，在此处执行单次覆盖加固
+    extern void force_write_fan_register_from_config(void);
+    force_write_fan_register_from_config();
+    // =========================================================================
+  
   if (!g_kstuff.game.active || g_kstuff.game.pid != pid)
     return;
 
@@ -866,6 +879,10 @@ void sm_kstuff_sleep_leave(void) {
   g_kstuff.sleep_pause_restore = false;
   mark_restore_needed();
   restore_kstuff_if_needed("system sleep");
+
+  // ====== 【风扇守护修改点：从待机模式苏醒瞬间拦截索尼重置】 ======
+    extern void force_write_fan_register_from_config(void);
+    force_write_fan_register_from_config();
 }
 
 void sm_kstuff_on_config_reload(void) {
