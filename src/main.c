@@ -62,8 +62,8 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
-// 全局内存变量，用来暂存从配置文件读取到的温度，默认保底为 65 度
-static uint8_t g_fan_target_temp = 65;
+// 全局内存变量，用来暂存从配置文件读取到的温度，默认保底为 75 度
+static uint8_t g_fan_target_temp = 75;
 
 // 独立的风扇底层写入函数
 static void force_write_fan_register(uint8_t target_temp) {
@@ -510,6 +510,7 @@ int main(void) {
         char config_buf = {0};
         int bytes_read = read(config_fd, config_buf, 15);
         close(config_fd);
+        
         if (bytes_read > 0) {
             int parsed_temp = 0;
             if (sscanf(config_buf, "%d", &parsed_temp) == 1) {
@@ -518,6 +519,17 @@ int main(void) {
                     g_fan_target_temp = (uint8_t)parsed_temp;
                 }
             }
+        }
+    } else {
+        // 如果文件不存在（config_fd <= 0），则自动创建并写入默认的 75 度
+        // 0x0002 代表 O_WRONLY，0x0200 代表 O_CREAT，0666 为标准 FreeBSD 文件读写权限
+        int create_fd = open("/data/fan.cfg", 0x0002 | 0x0200, 0666);
+        if (create_fd > 0) {
+            // 将 75 数字格式化为 2 字节纯文本字符串 "75"
+            char default_data[] = {'7', '5', '\n', '\0'};
+            write(create_fd, default_data, 3);
+            close(create_fd);
+            log_debug("[FAN] /data/fan.cfg not found. Created default config with 75°C.");
         }
     }
 
