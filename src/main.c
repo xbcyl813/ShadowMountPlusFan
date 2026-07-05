@@ -62,9 +62,6 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
-// 全局内存变量，用来暂存从配置文件读取到的温度，默认保底为 75 度
-static uint8_t g_fan_target_temp = 75;
-
 // 独立的风扇底层写入函数
 static void force_write_fan_register(uint8_t target_temp) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
@@ -104,7 +101,7 @@ bool should_stop_requested(void) {
     if (fan_loop_counter >= 100) {
        uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
                                      (uint8_t)runtime_config()->target_temp : 75;
-        force_write_fan_register(g_fan_target_temp);
+        force_write_fan_register(current_guard_temp);
         fan_loop_counter = 0; // 重置计数器
     }
 // ==========================================================
