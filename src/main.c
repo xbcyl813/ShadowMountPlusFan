@@ -40,6 +40,13 @@
 //#define AUTHID_BASE 0x4801000000000013L
 #define AUTHID_BASE 0x4800000000000006ull
 
+static volatile sig_atomic_t g_stop_requested = 0;
+static atomic_bool g_shutdown_on_going_stop_requested = false;
+static atomic_bool g_runtime_sleep_mode_active = false;
+static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
+static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
+static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // ============================================================================
 // 【全新加入】：全独立系统级 2D 透明悬浮层控制与硬件传感器读取桩声明
 // ============================================================================
@@ -57,10 +64,7 @@ extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipSt
 extern int32_t sceVideoOutOpen(int32_t videoOutBusId, int32_t unk0, int32_t unk1, void* param);
 extern int32_t sceVideoOutClose(int32_t handle);
 
-// 借用原装 sm_mdbg 中已经完全实现并导出的原生显存映射句柄获取符号
-extern void* mdbg_get_overlay_vram_ptr(int32_t handle);
-
-// 全系统免进程注入的物理帧率计算函数
+// 免进程注入的系统全局物理帧率计算函数
 static float calculate_global_system_fps(void) {
     static struct SceVideoOutFlipStatus last_status = {0};
     struct SceVideoOutFlipStatus current_status = {0};
@@ -72,13 +76,6 @@ static float calculate_global_system_fps(void) {
     if (time_diff == 0) return 0.0f;
     return ((float)frame_diff / (float)time_diff) * 1000000.0f;
 }
-
-static volatile sig_atomic_t g_stop_requested = 0;
-static atomic_bool g_shutdown_on_going_stop_requested = false;
-static atomic_bool g_runtime_sleep_mode_active = false;
-static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
-static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
-static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 内建简易 8x8 ASCII 像素点阵字库字模，用于直接在独立透明悬浮层上画字，0图形库依赖
 static const uint8_t font_bitmap[256][8] = {
@@ -108,17 +105,15 @@ static const uint8_t font_bitmap[256][8] = {
 
 static void draw_overlay_text_to_buffer(uint32_t* overlay_vram, const char* text) {
     if (!overlay_vram || !text) return;
-    int start_x = 40;  // 悬浮层内部画字的 X 起点
-    int start_y = 50;  // 悬浮层内部画字的 Y 起点
-    uint32_t text_color = 0xFF00FF00; // 纯绿色
+    int start_x = 40;  
+    int start_y = 50;  
+    uint32_t text_color = 0xFF00FF00; 
     
-    // 强制清除上一秒残余的字迹（完全清空为透明底，ARGB）
     for (int y = start_y; y < start_y + 10; y++) {
         for (int x = start_x; x < start_x + 450; x++) {
             overlay_vram[y * 1920 + x] = 0x00000000;
         }
     }
-    // 像素级逐字涂抹
     for (size_t i = 0; i < strlen(text); i++) {
         uint8_t c = (uint8_t)text[i];
         for (int row = 0; row < 8; row++) {
@@ -136,7 +131,7 @@ static void draw_overlay_text_to_buffer(uint32_t* overlay_vram, const char* text
     }
 }
 
-// 全系统级独立 2D 透明图层置顶常驻线程
+// 全系统级独立 2D 透明图层置顶常驻线程（动态查找解耦版：彻底解决 undefined symbol 报错）
 static void* smp_native_overlay_daemon_loop(void* arg) {
     (void)arg;
     int last_tracked_pid = 0;
@@ -146,24 +141,32 @@ static void* smp_native_overlay_daemon_loop(void* arg) {
     int32_t overlay_handle = -1;
     uint32_t* overlay_buffer_address = NULL;
 
-    // 🔒 核心开机保护锁：开机后无条件大睡 15 秒，确保原厂风扇设置和镜像加载 100% 优先平稳常驻
+    // A. 定义原生内部映射函数的指针原型，完全避开静态符号链接
+    typedef void* (*FN_GetOverlayVramPtr)(int32_t handle);
+    FN_GetOverlayVramPtr pfnMdbgGetOverlayVramPtr = NULL;
+
+    // B. 🔒 核心开机保护锁：开机后无条件大睡 15 秒，确保原厂风扇设置和镜像加载 100% 优先平稳常驻
     sceKernelUsleep(15000000u); 
 
+    // C. 运行时动态绑定本地自身的内部符号句柄，让 ld.lld 链接器彻底放行
+    void* self_handle = dlopen(NULL, RTLD_NOW);
+    if (self_handle) {
+        pfnMdbgGetOverlayVramPtr = (FN_GetOverlayVramPtr)dlsym(self_handle, "mdbg_get_overlay_vram_ptr");
+    }
+
     while (!g_stop_requested) {
-        // 后台静默扫描全系统应用状态树，寻找游戏进程
         int game_pid = (int)find_pid_by_name("eboot.bin", false);
 
         if (game_pid > 0) {
-            // 💡【5秒安全延时】：发现游戏启动了，静默原地休眠 5 秒钟！彻底错开并发冲突节点
+            // 💡【5秒安全延时】：发现游戏启动了，静默原地休眠 5 秒钟！错开并发冲突节点
             if (game_pid != last_tracked_pid) {
                 sceKernelUsleep(5000000u);
                 last_tracked_pid = game_pid;
                 
-                // 5秒后游戏挂载已完全稳定，主进程命令系统开辟一个专属于主程序的 2D 独立透明前置悬浮层
-                // 视频输出主轴 ID 2 通常为最高层级前置悬浮显示通道
+                // 5秒后游戏挂载已完全稳定，主程序开辟透明前置悬浮层
                 overlay_handle = sceVideoOutOpen(2, 0, 0, NULL);
-                if (overlay_handle >= 0) {
-                    overlay_buffer_address = (uint32_t*)mdbg_get_overlay_vram_ptr(overlay_handle);
+                if (overlay_handle >= 0 && pfnMdbgGetOverlayVramPtr) {
+                    overlay_buffer_address = (uint32_t*)pfnMdbgGetOverlayVramPtr(overlay_handle);
                 }
             }
             // 1秒1次 纯数值极其敏锐地抓取全系统参数大盘
@@ -192,11 +195,11 @@ static void* smp_native_overlay_daemon_loop(void* arg) {
             last_tracked_pid = 0;
         }
 
-        // 严格维持 1 秒跳变刷新一次，0 系统损耗
         sceKernelUsleep(1000000u);
     }
 
     if (overlay_handle >= 0) sceVideoOutClose(overlay_handle);
+    if (self_handle) dlclose(self_handle);
     return NULL;
 }
 
