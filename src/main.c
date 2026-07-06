@@ -96,40 +96,46 @@ static void* hw_monitor_daemon_loop(void* arg) {
     (void)arg;
     int apu_temp = 0;
     int cpu_temp = 0;
-    int notify_timer = 0;
-    
-    // 初始化风扇读取所需的变量
     uint16_t current_fan_duty = 0;
     uint64_t chassis_info = 0;
+    
+    // 初始化本地通信 Socket
+    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in target_addr;
+    memset(&target_addr, 0, sizeof(target_addr));
+    target_addr.sin_family = AF_INET;
+    target_addr.sin_port = htons(8899);                 // 外发给本地监听的 8899 端口
+    target_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // 本地环回地址
+
     extern int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
 
     while (g_hw_monitor_active && !g_stop_requested) {
-        // 1. 抓取实时帧率、APU温度、GPU温度
+        // 1. 抓取实时帧率、APU温度、GPU温度、风扇状态
         float current_fps = calculate_global_system_fps();
-        sceKernelGetSocSensorTemperature(0, &apu_temp); // GPU温度
-        sceKernelGetCpuTemperature(&cpu_temp);          // APU/CPU温度
+        sceKernelGetSocSensorTemperature(0, &apu_temp); 
+        sceKernelGetCpuTemperature(&cpu_temp);          
         
-        // 2. 抓取实际风扇转速百分比 (Duty)
         if (sceKernelGetCurrentFanDuty(&current_fan_duty, &chassis_info) != 0) {
-            current_fan_duty = 0; // 读取失败安全回退
+            current_fan_duty = 0; 
         }
         
-        // 3. 跨进程弹窗通知策略：每隔 5 秒定时刷新纯净信息
-        if (notify_timer++ >= 10) { // 采样周期 500ms * 10 = 5 秒
-            char monitor_msg[128];
-            
-            // 依次直接显示：帧率、APU温度、GPU温度、风扇转速百分比
-            snprintf(monitor_msg, sizeof(monitor_msg),
-                     "FPS: %.1f\nAPU: %d°C\nGPU: %d°C\nFAN: %u%%",
-                     current_fps, cpu_temp, apu_temp, (unsigned int)current_fan_duty);
-            
-            // 发送系统原生气泡通知
-            notify_system(monitor_msg);
-            notify_timer = 0;
+        // 2. 依次直接组装纯净的数据包字符串
+        char network_packet[64];
+        snprintf(network_packet, sizeof(network_packet),
+                 "FPS:%.1f|APU:%d|GPU:%d|FAN:%u",
+                 current_fps, cpu_temp, apu_temp, (unsigned int)current_fan_duty);
+        
+        // 3. 将最新状态推向本地的左上角 Overlay 显示层
+        if (sock_fd >= 0) {
+            sendto(sock_fd, network_packet, strlen(network_packet), 0, 
+                   (struct sockaddr*)&target_addr, sizeof(target_addr));
         }
-        // 休眠 500 毫秒，1 秒轮询两次
-        sceKernelUsleep(500000u);
+
+        // 精准 1 秒刷新一次
+        sceKernelUsleep(1000000u);
     }
+
+    if (sock_fd >= 0) close(sock_fd);
     return NULL;
 }
 
