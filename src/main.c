@@ -40,13 +40,99 @@
 //#define AUTHID_BASE 0x4801000000000013L
 #define AUTHID_BASE 0x4800000000000006ull
 
-
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
 static atomic_bool g_runtime_sleep_mode_active = false;
 static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// ============================================================================
+// 温度监控变量
+// ============================================================================
+extern int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
+extern int sceKernelGetCpuTemperature(int* cputemp);
+
+// 视频输出底层结构体，用于全系统免注入 FPS 捕获
+struct SceVideoOutFlipStatus {
+    uint64_t count;
+    uint64_t processTime;
+    uint64_t reserved0; 
+};
+
+extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
+
+// 声明外部已经由原有主程序实现的通知系统调用
+extern void notify_system(const char *text, ...);
+
+// 硬件监控子线程生命周期控制变量
+static volatile int g_hw_monitor_active = 1;
+
+// 免注入全局帧率物理倒推计算函数
+static float calculate_global_system_fps(void) {
+    static struct SceVideoOutFlipStatus last_status = {0};
+    struct SceVideoOutFlipStatus current_status = {0};
+    
+    // 句柄 1 代表 PS5 视频输出主通道 (Bus Main)
+    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) {
+        return 0.0f;
+    }
+    if (last_status.count == 0) {
+        last_status = current_status;
+        return 0.0f;
+    }
+    
+    uint64_t frame_diff = current_status.count - last_status.count;
+    uint64_t time_diff = current_status.processTime - last_status.processTime; // 微秒
+    
+    last_status = current_status;
+    
+    if (time_diff == 0) return 0.0f;
+    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
+}
+
+// 独立的常驻后台监控守护进程主循环
+static void* hw_monitor_daemon_loop(void* arg) {
+    (void)arg;
+    int apu_temp = 0;
+    int cpu_temp = 0;
+    int notify_timer = 0;
+    
+    // 初始化风扇读取所需的变量
+    uint16_t current_fan_duty = 0;
+    uint64_t chassis_info = 0;
+    extern int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
+
+    while (g_hw_monitor_active && !g_stop_requested) {
+        // 1. 抓取实时帧率、APU温度、GPU温度
+        float current_fps = calculate_global_system_fps();
+        sceKernelGetSocSensorTemperature(0, &apu_temp); // GPU温度
+        sceKernelGetCpuTemperature(&cpu_temp);          // APU/CPU温度
+        
+        // 2. 抓取实际风扇转速百分比 (Duty)
+        if (sceKernelGetCurrentFanDuty(&current_fan_duty, &chassis_info) != 0) {
+            current_fan_duty = 0; // 读取失败安全回退
+        }
+        
+        // 3. 跨进程弹窗通知策略：每隔 5 秒定时刷新纯净信息
+        if (notify_timer++ >= 10) { // 采样周期 500ms * 10 = 5 秒
+            char monitor_msg[128];
+            
+            // 依次直接显示：帧率、APU温度、GPU温度、风扇转速百分比
+            snprintf(monitor_msg, sizeof(monitor_msg),
+                     "FPS: %.1f\nAPU: %d°C\nGPU: %d°C\nFAN: %u%%",
+                     current_fps, cpu_temp, apu_temp, (unsigned int)current_fan_duty);
+            
+            // 发送系统原生气泡通知
+            notify_system(monitor_msg);
+            notify_timer = 0;
+        }
+
+        // 休眠 500 毫秒，1 秒轮询两次
+        sceKernelUsleep(500000u);
+    }
+    return NULL;
+}
 
 typedef struct {
   pthread_mutex_t reason_mutex;
@@ -572,6 +658,17 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
+
+    // ========================================================================
+    // 【精准挂载点】：在这里初始化并启动我们的常驻独立硬件监控子线程
+    // ========================================================================
+    pthread_t smp_metrics_thread;
+    pthread_attr_t smp_metrics_attr;
+    pthread_attr_init(&smp_metrics_attr);
+    pthread_attr_setdetachstate(&smp_metrics_attr, PTHREAD_CREATE_DETACHED); // 设置为分离模式避免常驻死锁
+    pthread_create(&smp_metrics_thread, &smp_metrics_attr, hw_monitor_daemon_loop, NULL);
+    pthread_attr_destroy(&smp_metrics_attr);
+  
   sm_scanner_run_loop();
 
 shutdown:
