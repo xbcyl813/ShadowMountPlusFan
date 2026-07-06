@@ -73,14 +73,7 @@ jobs:
 
       - name: Build payload
         run: |
-          make clean all PS5_SCE_STUBS_DIR="$GITHUB_WORKSPACE/ps5-sdk/sce_stubs"
-      # ========================================================================
-      # 自动进入子目录，使用 SDK 链独立编译游戏内 1秒1次 刷新插件
-      # ========================================================================
-      - name: Build Independent Overlay SPRX Plugin
-        run: |
-          cd overlay_plugin
-          make clean all PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
+          make clean all PS5_SCE_STUBS_DIR="$GITHUB_WORKSPACE/ps5-sdk/sce_stubs"     
 
       - name: Create release archive
         id: package
