@@ -1,7 +1,9 @@
 #include "sm_platform.h"
+
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/sysctl.h>
+
 #include "sm_runtime.h"
 #include "sm_types.h"
 #include "sm_log.h"
@@ -21,7 +23,6 @@
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
-#include <dlfcn.h>
 
 #ifndef SHADOWMOUNT_VERSION
 #define SHADOWMOUNT_VERSION "unknown"
@@ -39,168 +40,13 @@
 //#define AUTHID_BASE 0x4801000000000013L
 #define AUTHID_BASE 0x4800000000000006ull
 
+
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
 static atomic_bool g_runtime_sleep_mode_active = false;
 static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// ============================================================================
-// 【全新加入】：全独立系统级 2D 透明悬浮层控制与硬件传感器读取桩声明
-// ============================================================================
-extern int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
-extern int sceKernelGetCpuTemperature(int* cputemp);
-extern int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
-
-// 导入开辟全系统置顶独立透明 2D 页面层所需的官方 VideoOut 桩
-struct SceVideoOutFlipStatus {
-    uint64_t count;
-    uint64_t processTime;
-    uint64_t reserved0; 
-};
-extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
-extern int32_t sceVideoOutOpen(int32_t videoOutBusId, int32_t unk0, int32_t unk1, void* param);
-extern int32_t sceVideoOutClose(int32_t handle);
-
-// 免进程注入的系统全局物理帧率计算函数
-static float calculate_global_system_fps(void) {
-    static struct SceVideoOutFlipStatus last_status = {0};
-    struct SceVideoOutFlipStatus current_status = {0};
-    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) return 0.0f;
-    if (last_status.count == 0) { last_status = current_status; return 0.0f; }
-    uint64_t frame_diff = current_status.count - last_status.count;
-    uint64_t time_diff = current_status.processTime - last_status.processTime; 
-    last_status = current_status;
-    if (time_diff == 0) return 0.0f;
-    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
-}
-
-// 内建简易 8x8 ASCII 像素点阵字库字模，用于直接在独立透明层上画字（对齐维度）
-static const uint8_t font_bitmap[256][8] = {
-    ['F'] = {0xFC, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00},
-    ['P'] = {0xFC, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00},
-    ['S'] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00},
-    ['A'] = {0x38, 0x6C, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0x00},
-    ['U'] = {0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00},
-    ['G'] = {0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00},
-    [':'] = {0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00},
-    ['.'] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00},
-    ['%'] = {0xC6, 0xC8, 0x10, 0x20, 0x40, 0x13, 0x63, 0x00},
-    ['|'] = {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00},
-    [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-    ['0'] = {0x3E, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3E, 0x00},
-    ['1'] = {0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00},
-    ['2'] = {0x3E, 0x66, 0x06, 0x1E, 0x30, 0x66, 0x7E, 0x00},
-    ['3'] = {0x3E, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3E, 0x00},
-    ['4'] = {0x1C, 0x34, 0x64, 0x64, 0x7E, 0x14, 0x14, 0x00},
-    ['5'] = {0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3E, 0x00},
-    ['6'] = {0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3E, 0x00},
-    ['7'] = {0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00},
-    ['8'] = {0x3E, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3E, 0x00},
-    ['9'] = {0x3E, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00},
-    ['C'] = {0x3E, 0x66, 0x60, 0x60, 0x60, 0x60, 0x3E, 0x00}
-};
-
-static void draw_overlay_text_to_buffer(uint32_t* overlay_vram, const char* text) {
-    if (!overlay_vram || !text) return;
-    int start_x = 40;  
-    int start_y = 50;  
-    uint32_t text_color = 0xFF00FF00; 
-    
-    for (int y = start_y; y < start_y + 10; y++) {
-        for (int x = start_x; x < start_x + 450; x++) {
-            overlay_vram[y * 1920 + x] = 0x00000000;
-        }
-    }
-    for (size_t i = 0; i < strlen(text); i++) {
-        uint8_t c = (uint8_t)text[i];
-        for (int row = 0; row < 8; row++) {
-            uint8_t bits = font_bitmap[c][row];
-            for (int col = 0; col < 8; col++) {
-                if (bits & (0x80 >> col)) {
-                    int p_x = start_x + (i * 8) + col;
-                    int p_y = start_y + row;
-                    if (p_x < 1920 && p_y < 1080) {
-                        overlay_vram[p_y * 1920 + p_x] = text_color;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// 全系统级独立 2D 透明图层置顶常驻线程（动态查找解耦版：彻底解决 undefined symbol 报错）
-static void* smp_native_overlay_daemon_loop(void* arg) {
-    (void)arg;
-    int last_tracked_pid = 0;
-    int apu_temp = 0, cpu_temp = 0;
-    uint16_t fan_duty = 0;
-    uint64_t chassis = 0;
-    int32_t overlay_handle = -1;
-    uint32_t* overlay_buffer_address = NULL;
-
-    // A. 定义原生内部映射函数的指针原型，完全避开静态符号链接
-    typedef void* (*FN_GetOverlayVramPtr)(int32_t handle);
-    FN_GetOverlayVramPtr pfnMdbgGetOverlayVramPtr = NULL;
-
-    // B. 🔒 核心开机保护锁：开机后无条件大睡 15 秒，确保原厂风扇设置和镜像加载 100% 优先平稳常驻
-    sceKernelUsleep(15000000u); 
-
-    // C. 运行时动态绑定本地自身的内部符号句柄，让 ld.lld 链接器彻底放行
-    void* self_handle = dlopen(NULL, RTLD_NOW);
-    if (self_handle) {
-        pfnMdbgGetOverlayVramPtr = (FN_GetOverlayVramPtr)dlsym(self_handle, "mdbg_get_overlay_vram_ptr");
-    }
-
-    while (!g_stop_requested) {
-        int game_pid = (int)find_pid_by_name("eboot.bin", false);
-
-        if (game_pid > 0) {
-            // 💡【5秒安全延时】：发现游戏启动了，静默原地休眠 5 秒钟！错开并发冲突节点
-            if (game_pid != last_tracked_pid) {
-                sceKernelUsleep(5000000u);
-                last_tracked_pid = game_pid;
-                
-                // 5秒后游戏挂载已完全稳定，主程序开辟透明前置悬浮层
-                overlay_handle = sceVideoOutOpen(2, 0, 0, NULL);
-                if (overlay_handle >= 0 && pfnMdbgGetOverlayVramPtr) {
-                    overlay_buffer_address = (uint32_t*)pfnMdbgGetOverlayVramPtr(overlay_handle);
-                }
-            }
-            // 1秒1次 纯数值极其敏锐地抓取全系统参数大盘
-            float live_fps = calculate_global_system_fps();
-            sceKernelGetSocSensorTemperature(0, &apu_temp);
-            sceKernelGetCpuTemperature(&cpu_temp);
-            if (sceKernelGetCurrentFanDuty(&fan_duty, &chassis) != 0) { fan_duty = 0; }
-
-            char overlay_buffer[128];
-            snprintf(overlay_buffer, sizeof(overlay_buffer), 
-                     "FPS: %.1f | APU: %d C | GPU: %d C | FAN: %u%%", 
-                     live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty);
-
-            // 直接利用点阵引擎，将绿色数字刷写入我们独占的透明硬件图层最左上角
-            if (overlay_buffer_address) {
-                draw_overlay_text_to_buffer(overlay_buffer_address, overlay_buffer);
-            }
-        } 
-        else if (game_pid <= 0 && last_tracked_pid > 0) {
-            // 💡【退出自动蒸发】：当检测到游戏关闭退出了，立刻执行图层关闭指令
-            if (overlay_handle >= 0) {
-                sceVideoOutClose(overlay_handle);
-                overlay_handle = -1;
-                overlay_buffer_address = NULL;
-            }
-            last_tracked_pid = 0;
-        }
-
-        sceKernelUsleep(1000000u);
-    }
-
-    if (overlay_handle >= 0) sceVideoOutClose(overlay_handle);
-    if (self_handle) dlclose(self_handle);
-    return NULL;
-}
 
 typedef struct {
   pthread_mutex_t reason_mutex;
@@ -726,17 +572,6 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
-
-    // ========================================================================
-    // 【终极安全挂载点】：在 SMP 准备进入原本的阻塞扫描主循环前，平行的拉起雷达
-    // ========================================================================
-    pthread_t monitor_th;
-    pthread_attr_t monitor_attr;
-    pthread_attr_init(&monitor_attr);
-    pthread_attr_setdetachstate(&monitor_attr, PTHREAD_CREATE_DETACHED); 
-    pthread_create(&monitor_th, &monitor_attr, smp_native_overlay_daemon_loop, NULL);
-    pthread_attr_destroy(&monitor_attr);
-  
   sm_scanner_run_loop();
 
 shutdown:
