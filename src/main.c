@@ -75,9 +75,16 @@ static void force_write_fan_register(uint8_t target_temp) {
 
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
-    uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
-                                 (uint8_t)runtime_config()->target_temp : 75;
-    force_write_fan_register(current_guard_temp);
+    uint32_t target_temp = runtime_config()->target_temp;
+   // 判断参数值是否为空，如果是空值，取默认值 75 度
+     if (target_temp == 0u) {
+          target_temp = 75u;
+      }
+   // 基础的边界安全限幅，将温度阈值控制在60到85度之间。
+    else if (target_temp < 60u || target_temp > 85u) {
+        target_temp = 75u;
+       }  
+    force_write_fan_register((uint8_t)target_temp);
 }
 
 static void on_signal(int sig) {
@@ -491,7 +498,9 @@ int main(void) {
     // ====== 【风扇冷启动初次应用配置】 ======
     sceKernelUsleep(2000000u);
     force_write_fan_register_from_config();
-    notify_system("Fan Threshold Set to %d°C!", (int)runtime_config()->target_temp);
+    // 弹窗显示最终生效的温度阈值
+    uint32_t show_temp = (runtime_config()->target_temp == 0u) ? 75u : runtime_config()->target_temp;
+    notify_system("Fan Threshold Set to %d°C!", (int)show_temp);
     sceKernelUsleep(2000000u);
     // ==============================================================================
   
