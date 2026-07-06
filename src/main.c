@@ -61,50 +61,6 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
-// ====== 【修改点 1/2：完美对齐官方数据结构的 Union 数组版执行端】 ======
-static void force_write_fan_register(uint8_t target_temp) {
-    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
-    if (fan_fd > 0) {
-        // 【核心修复点】：显式加上 [7] 和 [28] 声明为真数组，彻底消除 subscripted 标量编译报错！
-        union {
-            uint32_t high_fw_data[7];   // 10.xx/11.xx 认的 7 个 uint32_t（总共 28 字节）
-            uint8_t  low_fw_data[28];   // 3.00~9.60 认的 28 个 uint8_t（总共 28 字节）
-        } aligned_packet;
-
-        // 此时 aligned_packet.low_fw_data 已转为标准数组，LLVM 绝不报错，安全清零 28 字节
-        for (int i = 0; i < 28; i++) {
-            aligned_packet.low_fw_data[i] = 0;
-        }
-
-        // 调用原厂底层的内核固件获取函数
-        uint32_t raw_fw = kernel_get_fw_version();
-        uint32_t major_version = (raw_fw >> 24) & 0xFFu;
-
-        if (major_version >= 0x10u) {
-            // 【10.01 / 10.60 / 11.xx 高版本固件阵营】：
-            // 采用最标准的个位数硬件挡位映射！用户的 75°C 现场代入计算：5u - ((75u - 60u) / 6u) = 5 - 2 = 3u！
-            // 算出的个位数黄金 3 挡（3u）具有极强的自适应兼容性，10.01 和 10.60 都能完美听懂且绝不溢出！
-            // 完美对齐您的真数组格式，精准塞入整个数据包最前排第 1 个 uint32_t 槽位（索引 0）！
-            uint32_t calculated_gear = 5u - (((uint32_t)target_temp - 60u) / 6u);
-            if (calculated_gear < 1u) calculated_gear = 1u;
-            if (calculated_gear > 5u) calculated_gear = 5u;
-
-            aligned_packet.high_fw_data[0] = calculated_gear;
-        } else {
-            // 【3.00 ~ 9.60 低版本固件阵营（包含 4.03, 7.61, 9.00）】：
-            // 没有任何指针偏移，将摄氏度数字（如 75）刻在整个数据包的【第 6 个字节（索引 5）】上！
-            // 采用 Union 后，低版本语境绝对对齐，Padding 错位百分之百彻底物理归零！
-            aligned_packet.low_fw_data[5] = target_temp;
-        }
-
-        // 下发 Union 二进制级别物理锁死、无可挑剔的标准 28 字节硬件控制流数据包
-        ioctl(fan_fd, 0xC01C8F07, &aligned_packet);
-        close(fan_fd);
-    }
-}
-// ==============================================================================
-
-
 void force_write_fan_register_from_config(void);
 
 //  全局温度状态变量，用来存放最终生效的真实硬件温度
@@ -112,6 +68,16 @@ uint8_t g_final_active_temp = 75;
 //全局配置合规性变量。默认置为 false（完全合规）
 // 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
 bool g_fan_config_invalid = false;
+
+// 独立的风扇底层快捷写入函数
+static void force_write_fan_register(uint8_t target_temp) {
+    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
+    if (fan_fd > 0) {
+        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
+        ioctl(fan_fd, 0xC01C8F07, data);
+        close(fan_fd);
+    }
+}
 
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
@@ -545,28 +511,21 @@ int main(void) {
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
 
-    // ====== 【修改点 2/2：冷启动初始化与全局唯一计算源中心注入】 ======
-    sceKernelUsleep(2000000u); // 转换前等待 2 秒
-
-    // 1. 触发你原本就完美的 force_write_fan_register_from_config 包装函数
-    // 它会自动读取内存、完成 60~85 限幅并对全局变量 g_fan_config_invalid 进行合规性染色
-    // 由于我们在上面将物理端重构为了 Union 数组版，这里一调用，开机初次变速立即在内存和硬件级别完美生效！
+    // ====== 【风扇冷启动初次应用配置】 ======
+    sceKernelUsleep(2000000u);
     force_write_fan_register_from_config();
-
-    // 2. 独立把弹窗和延迟留在 main 内部，根据全局布尔标志状态，下发最精准的人机交互反馈
+    // 弹窗显示最终生效的温度阈值
     if (g_fan_config_invalid) {
-        // 如果用户的配置超出范围或写漏，连续飘出两行警告，UX 体验极佳
+        // 如果用户的配置超出范围或写漏，连续飘出两行警告，彻底打消用户的疑惑
         notify_system("Warning: Fan config out of safe range (60-85°C)!");
         sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
-        notify_system("Default threshold adopted: 75°C!");
+        notify_system("Default threshold adopted: %d°C!", (int)g_final_active_temp);
     } else {
-        // 如果用户的配置完全合法，则直接读取全局变量里的数字，清爽平滑地飘出标准成功气泡
+        // 如果用户的配置完全合法，则清爽平滑地飘出标准成功气泡
         notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
     }
-
-    sceKernelUsleep(2000000u); // 转换后等待 2 秒
+    sceKernelUsleep(2000000u);
     // ==============================================================================
-
   
   sm_notifications_init();
   stop_conflicting_backpork();
