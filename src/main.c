@@ -48,40 +48,56 @@ static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// 独立的常驻后台监控守护进程主循环（天才延时版：完美错开高并发冲突）
+#include <dlfcn.h> // 必须确保 main.c 顶部有此标准的动态链接库头文件
+
+// 独立的常驻后台监控守护进程主循环（动态句柄查找加固版：彻底解决 ld.lld 未定义符号链接报错）
 static void* smp_metrics_injector_daemon(void* arg) {
     (void)arg;
     int last_injected_pid = 0;
 
+    // A. 🔒 开机/载荷激活后，让雷达无条件死睡 15 秒钟，让原装功能完美跑完，保障进程常驻与风扇控制
+    sceKernelUsleep(15000000u); 
+
+    // B. 定义跨进程库注入函数的函数指针原型（完全隐去函数名，只留数据类型）
+    typedef int (*FN_LoadModulePid)(int pid, const char *path, size_t args_size, const void *args, int flags, void *unknown, int *res);
+    FN_LoadModulePid pfnSceKernelLoadStartModuleForPid = NULL;
+
+    // C. 动态在系统的 libkernel.sprx 空间中搜寻并抓取注入函数的物理入口指针
+    void* libkernel_handle = dlopen("libkernel.sprx", RTLD_NOW);
+    if (libkernel_handle) {
+        // 通过动态字符串查找，将函数入口秘密赋予指针。这样链接器（ld.lld）完全看不见该符号，100%放行
+        pfnSceKernelLoadStartModuleForPid = (FN_LoadModulePid)dlsym(libkernel_handle, "sceKernelLoadStartModuleForPid");
+    }
+
     while (!g_stop_requested) {
-        // 每 1 秒在后台寻找系统里是否有活跃游戏 eboot.bin 运行
+        // 每 1 秒静默扫描一次系统进程树
         int game_pid = (int)find_pid_by_name("eboot.bin", false);
 
         if (game_pid > 0 && game_pid != last_injected_pid) {
-            // ================================================================
-            // 💡【核心天才设计】：当发现游戏开始运行后，原地安全休眠 5 秒钟！
-            // 此时主程序 SMP 已经完满搞定：Fakelib绑定、风扇提速、内核提权加载等所有重任。
-            // ================================================================
+            // 💡 发现游戏运行了，原地安全休眠 5 秒钟，完美错开原版 SMP 挂载时序冲突！
             sceKernelUsleep(5000000u); 
 
-            // 再次确认 5 秒后游戏依然在正常活着，然后优雅贴入图形补丁
-            if ((int)find_pid_by_name("eboot.bin", false) == game_pid) {
+            // 再次确认 5 秒后游戏还在正常运行，且成功动态解出了符号指针，则通过指针执行贴片注入
+            if (pfnSceKernelLoadStartModuleForPid && (int)find_pid_by_name("eboot.bin", false) == game_pid) {
                 int inject_res = 0;
                 const char *smp_overlay_path = "/data/shadowmount/smp_overlay.sprx";
-                sceKernelLoadStartModuleForPid(game_pid, smp_overlay_path, 0, NULL, 0, NULL, &inject_res);
+                
+                // 🛠️ 核心修正：使用指针 pfnSceKernelLoadStartModuleForPid 代替原本的静态函数名调用！
+                pfnSceKernelLoadStartModuleForPid(game_pid, smp_overlay_path, 0, NULL, 0, NULL, &inject_res);
             }
-            
             last_injected_pid = game_pid;
         } 
         else if (game_pid <= 0) {
-            // 当游戏退出时，清空历史记录，等待下一次开启新游戏
             last_injected_pid = 0;
         }
 
         sceKernelUsleep(1000000u);
     }
+
+    if (libkernel_handle) dlclose(libkernel_handle);
     return NULL;
 }
+
 
 typedef struct {
   pthread_mutex_t reason_mutex;
