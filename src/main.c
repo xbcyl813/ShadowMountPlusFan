@@ -69,16 +69,6 @@ uint8_t g_final_active_temp = 75;
 // 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
 bool g_fan_config_invalid = false;
 
-// 独立的风扇底层快捷写入函数
-static void force_write_fan_register(uint8_t target_temp) {
-    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
-    if (fan_fd > 0) {
-        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
-        ioctl(fan_fd, 0xC01C8F07, data);
-        close(fan_fd);
-    }
-}
-
 //  28 字节联合体数组，保存写入值
 static void force_write_fan_register_adaptive(uint32_t fw_version) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
