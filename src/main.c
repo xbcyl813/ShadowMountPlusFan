@@ -23,10 +23,6 @@
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
-#include <dlfcn.h> // 必须确保 main.c 顶部有此标准的动态链接库头文件
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #ifndef SHADOWMOUNT_VERSION
 #define SHADOWMOUNT_VERSION "unknown"
@@ -44,154 +40,13 @@
 //#define AUTHID_BASE 0x4801000000000013L
 #define AUTHID_BASE 0x4800000000000006ull
 
+
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
 static atomic_bool g_runtime_sleep_mode_active = false;
 static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-extern int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
-extern int sceKernelGetCpuTemperature(int* cputemp);
-extern int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
-
-struct SceVideoOutFlipStatus {
-    uint64_t count;
-    uint64_t processTime;
-    uint64_t reserved0; 
-};
-extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
-
-static float calculate_global_system_fps(void) {
-    static struct SceVideoOutFlipStatus last_status = {0};
-    struct SceVideoOutFlipStatus current_status = {0};
-    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) return 0.0f;
-    if (last_status.count == 0) { last_status = current_status; return 0.0f; }
-    uint64_t frame_diff = current_status.count - last_status.count;
-    uint64_t time_diff = current_status.processTime - last_status.processTime; 
-    last_status = current_status;
-    if (time_diff == 0) return 0.0f;
-    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
-}
-
-// 内建 PHU 点阵字库，用于在透明系统图层上静音画字 ［()］
-static const uint8_t font_bitmap[256][8] = {
-    ['F'] = {0xFC, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00},
-    ['P'] = {0xFC, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00},
-    ['S'] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00},
-    ['A'] = {0x38, 0x6C, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0x00},
-    ['U'] = {0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00},
-    ['G'] = {0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00},
-    [':'] = {0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00},
-    ['.'] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00},
-    ['%'] = {0xC6, 0xC8, 0x10, 0x20, 0x40, 0x13, 0x63, 0x00},
-    ['|'] = {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00},
-    [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-    ['0'] = {0x3E, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3E, 0x00},
-    ['1'] = {0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00},
-    ['2'] = {0x3E, 0x66, 0x06, 0x1E, 0x30, 0x66, 0x7E, 0x00},
-    ['3'] = {0x3E, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3E, 0x00},
-    ['4'] = {0x1C, 0x34, 0x64, 0x64, 0x7E, 0x14, 0x14, 0x00},
-    ['5'] = {0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3E, 0x00},
-    ['6'] = {0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3E, 0x00},
-    ['7'] = {0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00},
-    ['8'] = {0x3E, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3E, 0x00},
-    ['9'] = {0x3E, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00},
-    ['C'] = {0x3E, 0x66, 0x60, 0x60, 0x60, 0x60, 0x3E, 0x00}
-}; ［()］
-
-static void draw_overlay_text_to_surface(uint32_t* surface, int width, const char* text) {
-    if (!surface || !text) return;
-    int start_x = 40;  int start_y = 50;
-    uint32_t text_color = 0xFF00FF00; // 纯绿色 ［()］
-    
-    // 强制清除上一秒留在画布上的旧字迹（完全清空为透明 ARGB）
-    for (int y = start_y; y < start_y + 10; y++) {
-        for (int x = start_x; x < start_x + 450; x++) {
-            surface[y * width + x] = 0x00000000;
-        }
-    }
-    for (size_t i = 0; i < strlen(text); i++) {
-        uint8_t c = (uint8_t)text[i];
-        for (int row = 0; row < 8; row++) {
-            uint8_t bits = font_bitmap[c][row];
-            for (int col = 0; col < 8; col++) {
-                if (bits & (0x80 >> col)) {
-                    int p_x = start_x + (i * 8) + col;
-                    int p_y = start_y + row;
-                    if (p_x < width && p_y < 1080) {
-                        surface[p_y * width + p_x] = text_color;
-                    }
-                }
-            }
-        }
-    } ［()］
-}
-
-static void* smp_metrics_injector_daemon(void* arg) {
-    (void)arg;
-    int last_tracked_pid = 0;
-    int apu_temp = 0, cpu_temp = 0;
-    uint16_t fan_duty = 0;
-    uint64_t chassis = 0;
-
-    // 🔒 核心安全开机保护锁：大睡 15 秒，确保原厂风扇阈值和镜像挂载 100% 优先成功常驻
-    sceKernelUsleep(15000000u); 
-
-    // 初始化标准 UDP 广播套接字
-    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in broadcast_addr;
-    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
-    broadcast_addr.sin_family = AF_INET;
-    broadcast_addr.sin_port = htons(9988); // 广播发送到局域网的 9988 端口
-    broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255"); // 全局广播地址
-    
-    // 开启套接字的全局广播特权
-    int broadcast_enable = 1;
-    if (udp_fd >= 0) {
-        setsockopt(udp_fd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable));
-    }
-
-    while (!g_stop_requested) {
-        // 后台静默检索是否有活跃游戏 eboot.bin 运行
-        int game_pid = (int)find_pid_by_name("eboot.bin", false);
-
-        if (game_pid > 0) {
-            // 💡【核心延时】：发现游戏拉起后，静默休眠 5 秒，等待原版时序平稳通过
-            if (game_pid != last_tracked_pid) {
-                sceKernelUsleep(5000000u);
-                last_tracked_pid = game_pid;
-            }
-
-            // 1秒1次 纯 C 干净抓取全系统硬件状态大盘
-            float live_fps = calculate_global_system_fps();
-            sceKernelGetSocSensorTemperature(0, &apu_temp);
-            sceKernelGetCpuTemperature(&cpu_temp);
-            if (sceKernelGetCurrentFanDuty(&fan_duty, &chassis) != 0) { fan_duty = 0; }
-
-            // 将参数组装成极简的网络纯净数据包，绝对不含任何弹窗气泡和文本内容
-            char network_packet[128];
-            snprintf(network_packet, sizeof(network_packet),
-                     "FPS:%.1f|APU:%d|GPU:%d|FAN:%u",
-                     live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty);
-
-            // 向局域网静默发射，一秒跳变一次
-            if (udp_fd >= 0) {
-                sendto(udp_fd, network_packet, strlen(network_packet), 0, 
-                       (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
-            }
-        } 
-        else if (game_pid <= 0) {
-            last_tracked_pid = 0;
-        }
-
-        // 精准 1 秒采集广播一次，0系统损耗
-        sceKernelUsleep(1000000u);
-    }
-
-    if (udp_fd >= 0) close(udp_fd);
-    return NULL;
-}   
 
 typedef struct {
   pthread_mutex_t reason_mutex;
@@ -717,27 +572,6 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
-
-    // ========================================================================
-    // 【终极安全挂载点】：在 SMP 准备进入原本的扫描主循环前，平行的拉起延时雷达
-    // ========================================================================
-    pthread_t monitor_th;
-    pthread_attr_t monitor_attr;
-    pthread_attr_init(&monitor_attr);
-    pthread_attr_setdetachstate(&monitor_attr, PTHREAD_CREATE_DETACHED); // 线程分离，防死锁
-    pthread_create(&monitor_th, &monitor_attr, smp_metrics_injector_daemon, NULL);
-    pthread_attr_destroy(&monitor_attr);
-
-    // ========================================================================
-    // 【平行孵化点】：在主程序准备进入原本的阻塞扫描主循环前，平行的拉起雷达
-    // ========================================================================
-    pthread_t monitor_th;
-    pthread_attr_t monitor_attr;
-    pthread_attr_init(&monitor_attr);
-    pthread_attr_setdetachstate(&monitor_attr, PTHREAD_CREATE_DETACHED); 
-    pthread_create(&monitor_th, &monitor_attr, smp_metrics_injector_daemon, NULL);
-    pthread_attr_destroy(&monitor_attr);
-  
   sm_scanner_run_loop();
 
 shutdown:
