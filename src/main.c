@@ -79,29 +79,36 @@ static void force_write_fan_register(uint8_t target_temp) {
     }
 }
 
-// 内部彻底根据固件版本，动态改变 28 字节数据包的物理排布！
+// 利用联合体(Union)锁死 28 字节内存，彻底消除编译器的错位污染
 static void force_write_fan_register_adaptive(uint32_t fw_version, uint8_t raw_temp, uint32_t calculated_duty) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
-        // 声明一个通用的 28 字节原始缓冲区，全清零保底
-        uint8_t packet_buf[28] = {0};
+        // 定义联合体，让高低版本的数据结构在内存中重叠，一字节都不准偏移！
+        union {
+            uint32_t high_fw_data[7]; // 10.xx/11.xx 认的 7 个 uint32_t (总共 28 字节)
+            uint8_t  low_fw_data[28]; // 3.00~9.60 认的 28 个 uint8_t  (总共 28 字节)
+        } aligned_packet;
+
+        // 全清零保底
+        for (int i = 0; i < 28; i++) {
+            aligned_packet.low_fw_data[i] = 0;
+        }
+
         uint32_t major_version = (fw_version >> 24) & 0xFFu;
 
         if (major_version >= 0x10u) {
-            // 【10.xx / 11.xx 高版本固件语境对齐】：
-            // 把计算出的占空比控制字（如 41），以 32位无符号整数形式，强行塞进整个数据包的【最前排前 4 字节】
-            packet_buf[0] = (uint8_t)(calculated_duty & 0xFFu);
-            packet_buf[1] = (uint8_t)((calculated_duty >> 8) & 0xFFu);
-            packet_buf[2] = (uint8_t)((calculated_duty >> 16) & 0xFFu);
-            packet_buf[3] = (uint8_t)((calculated_duty >> 24) & 0xFFu);
+            // 【10.xx / 11.xx 及最新高版本固件】：
+            // 把占空比控制字（如 41）塞入第 1 个 32 位整数（最前排 4 字节）
+            aligned_packet.high_fw_data[0] = calculated_duty;
         } else {
-            // 【3.00 ~ 9.60 低版本固件语境对齐】：
-            // 完美保留直通摄氏度模式，把原始的温度数字（如 75）规规矩矩地印在数据包的【第 5 个字节（索引4）】上！
-            packet_buf[4] = raw_temp;
+            // 【3.00 ~ 9.60 低版本固件（包含 4.03, 7.61, 9.00）】：
+            // 没有任何指针偏移，把原始温度数字（如 75）刻在第 5 个字节（索引4）上
+            // 采用联合体后，低版本不可能再产生任何 Padding 错位
+            aligned_packet.low_fw_data[4] = raw_temp;
         }
 
-        // 下发经过底层物理结构自适应重组后的 28 字节完美数据包
-        ioctl(fan_fd, 0xC01C8F07, packet_buf);
+        // 下发经过 Union 二进制级别绝对锁死、毫无缝隙的 28 字节数据包
+        ioctl(fan_fd, 0xC01C8F07, &aligned_packet);
         close(fan_fd);
     }
 }
@@ -121,23 +128,22 @@ void force_write_fan_register_from_config(void) {
         g_fan_config_invalid = true;
     }
 
-    // 全局变量保存真实的摄氏度（让 main 函数的弹窗无论在什么固件上都永远只显示正宗的摄氏度）
+    // 全局变量保存真实的摄氏度（弹窗在全系统全版本永远只飘出正确的摄氏度）
     g_final_active_temp = (uint8_t)target_temp;
 
     // 获取原厂 100% 存在的底层内核固件版本号
     uint32_t raw_fw = kernel_get_fw_version();
     uint32_t major_version = (raw_fw >> 24) & 0xFFu;
 
-    // 【熔断拦截】：远古 3.00 以下固件拒绝执行，保护硬件
+    //  3.00 以下固件拒绝执行，保护硬件
     if (major_version < 0x03u) {
         return;
     }
 
-    // 计算出针对 10.xx / 11.xx 固件绝对不溢出、最安静的 41u 占空比控制字
+    // 针对 10.xx / 11.xx 固件优化后的递减占空比映射公式
     uint32_t high_fw_duty = 50u - ((g_final_active_temp - 60u) * 3u / 5u);
 
-    // 调用我们在上面写好的、被赋予了灵魂的动态自适应执行端！
-    // 跨越文件和固件版本的阻隔，把 1) 原始固件号、2) 原始摄氏度、3) 高版本占空比 联合打包喂过去
+    // 调用动态自适应执行端
     force_write_fan_register_adaptive(raw_fw, g_final_active_temp, high_fw_duty);
 }
 
