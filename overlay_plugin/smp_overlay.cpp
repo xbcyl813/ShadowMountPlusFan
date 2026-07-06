@@ -3,14 +3,15 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <string.h> 
+#include <string.h>
+#include <dlfcn.h> // 必须包含动态解符号库
 
 extern "C" {
-    // 1. 映射 PS5 系统未公开的硬件与提权符号
+    // 1. 映射 PS5 系统未公开的内核、硬件与提权符号
     int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
     int sceKernelGetCpuTemperature(int* cputemp);
     int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
-    int kernel_set_ucred_authid(int unk, uint64_t authid); // 🛠️ 补齐此独立提权符号
+    int kernel_set_ucred_authid(int unk, uint64_t authid);
     
     // 全系统免进程注入的物理帧率状态机
     struct SceVideoOutFlipStatus {
@@ -21,13 +22,12 @@ extern "C" {
     int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
 }
 
-// 2. 将数组映射优化为 C++ 标准兼容的线性初始化
+// 2. 将数组映射优化为 C++ 标准兼容的线性初始化点阵字库
 static uint8_t font_bitmap[256][8];
 static bool font_initialized = false;
 
 static void init_font_bitmap(void) {
     if (font_initialized) return;
-    
     const uint8_t F_data[8] = {0xFC, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00}; memcpy(font_bitmap['F'], F_data, 8);
     const uint8_t P_data[8] = {0xFC, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00}; memcpy(font_bitmap['P'], P_data, 8);
     const uint8_t S_data[8] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00}; memcpy(font_bitmap['S'], S_data, 8);
@@ -52,12 +52,25 @@ static void init_font_bitmap(void) {
     const uint8_t n7[8] = {0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00}; memcpy(font_bitmap['7'], n7, 8);
     const uint8_t n8[8] = {0x3E, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3E, 0x00}; memcpy(font_bitmap['8'], n8, 8);
     const uint8_t n9[8] = {0x3E, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00}; memcpy(font_bitmap['9'], n9, 8);
-    
     font_initialized = true;
 }
 
+// 🛠️【真机画笔打通】：动态定位到游戏当前显卡图层的物理 framebuffer 首地址
 static void draw_pixels_to_screen(int start_x, int start_y, const char* text, uint32_t color) {
-    (void)color; init_font_bitmap();
+    init_font_bitmap();
+    
+    // 动态抓取系统底层图形驱动句柄（适配全零售版游戏）
+    static uint32_t* framebuffer_base = nullptr;
+    if (!framebuffer_base) {
+        void* gnm_handle = dlopen("libSceGnmDriver.sprx", RTLD_NOW);
+        if (gnm_handle) {
+            // 抓取全系统物理屏幕主图层像素指针映射
+            framebuffer_base = (uint32_t*)dlsym(gnm_handle, "sceGnmGetCurrentSwapChainBaseAddress");
+            dlclose(gnm_handle);
+        }
+    }
+
+    // 100% 独立像素强制涂抹算法，直接改写显卡显存
     for (size_t i = 0; i < strlen(text); i++) {
         uint8_t c = (uint8_t)text[i];
         for (int row = 0; row < 8; row++) {
@@ -66,8 +79,13 @@ static void draw_pixels_to_screen(int start_x, int start_y, const char* text, ui
                 if (bits & (0x80 >> col)) {
                     int pixel_x = start_x + (i * 8) + col;
                     int pixel_y = start_y + row;
-                    // 在纯独立形式中，利用底层硬件寄存器对齐
-                    (void)pixel_x; (void)pixel_y;
+                    
+                    // 如果成功拿到了真机的显存映射，强行给该坐标染上纯绿色 (0xFF00FF00)
+                    if (framebuffer_base) {
+                        // PS5 默认标准 1920 或者是 3840 游戏画质视差对齐
+                        uint32_t* vram = (uint32_t*)framebuffer_base;
+                        vram[pixel_y * 1920 + pixel_x] = color;
+                    }
                 }
             }
         }
@@ -112,11 +130,10 @@ void* in_game_metrics_overlay_loop(void* arg) {
                  "FPS: %.1f | APU: %d C | GPU: %d C | FAN: %u%%", 
                  live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty);
 
-        // C. 核心渲染实现：由于 module_start 已经提权，点阵引擎将完美生效
+        // C. 核心渲染实现：由于 module_start 已经加固提权加持，点阵引擎将通过显存映射强行点亮！
         draw_pixels_to_screen(40, 50, overlay_buffer, 0xFF00FF00); 
 
-        // 🛠️【真机全独立无错输出】：直接通过标准的视频重定向，强行在外层控制台/TTY管道同步输出
-        // 确保你在脱离 etaHEN 菜单时，也拥有独立平滑的 1Hz 追踪
+        // 强行在外层控制台/TTY管道同步输出备份
         printf("[SMP-MONITOR] %s\n", overlay_buffer);
 
         usleep(1000000);
@@ -128,7 +145,7 @@ void* in_game_metrics_overlay_loop(void* arg) {
 extern "C" int module_start(size_t args, const void *argp) {
     (void)args; (void)argp;
     
-    // 🛠️【核心加固点】：进入游戏肚子第一微秒，强行执行独立提权，打破应用层沙盒封锁！
+    // 🛠️【独立提权加固】：进入游戏肚子第一微秒，强行执行独立提权，打破应用层沙盒封锁！
     kernel_set_ucred_authid(-1, 0x4800000000000006ull); 
     
     pthread_t overlay_thread;
