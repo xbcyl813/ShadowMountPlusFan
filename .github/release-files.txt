@@ -2,7 +2,6 @@
 # One path per line, relative to the repository root.
 
 shadowmountplus.elf
-overlay_plugin/smp_overlay.sprx
 config.ini.example
 LICENSE
 make_image.bat
