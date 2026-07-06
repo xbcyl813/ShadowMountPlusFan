@@ -4,6 +4,40 @@
 #include <unistd.h>
 #include <pthread.h>
 
+extern "C" {
+    // 映射 PS5 游戏进程内天生就能直接豁免权限调用的未公开系统符号
+    int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
+    int sceKernelGetCpuTemperature(int* cputemp);
+    int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
+    
+    // 全系统免进程注入的物理帧率状态机
+    struct SceVideoOutFlipStatus {
+        uint64_t count;
+        uint64_t processTime;
+        uint64_t reserved0; 
+    };
+    int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
+}
+
+// 免注入全局帧率物理倒推计算函数
+static float calculate_in_game_fps(void) {
+    static struct SceVideoOutFlipStatus last_status = {0};
+    struct SceVideoOutFlipStatus current_status = {0};
+    
+    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) return 0.0f;
+    if (last_status.count == 0) {
+        last_status = current_status;
+        return 0.0f;
+    }
+    
+    uint64_t frame_diff = current_status.count - last_status.count;
+    uint64_t time_diff = current_status.processTime - last_status.processTime; 
+    last_status = current_status;
+    
+    if (time_diff == 0) return 0.0f;
+    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
+}
+
 // ============================================================================
 // 【内建 ASCII 8x8 字符点阵映射库】无需任何外部字库，100% 独立通过构建
 // ============================================================================
@@ -53,40 +87,6 @@ static void draw_pixels_to_screen(int start_x, int start_y, const char* text, ui
             }
         }
     }
-}
-
-extern "C" {
-    // 映射 PS5 游戏进程内天生就能直接豁免权限调用的未公开系统符号
-    int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
-    int sceKernelGetCpuTemperature(int* cputemp);
-    int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
-    
-    // 全系统免进程注入的物理帧率状态机
-    struct SceVideoOutFlipStatus {
-        uint64_t count;
-        uint64_t processTime;
-        uint64_t reserved0; 
-    };
-    int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
-}
-
-// 免注入全局帧率物理倒推计算函数
-static float calculate_in_game_fps(void) {
-    static struct SceVideoOutFlipStatus last_status = {0};
-    struct SceVideoOutFlipStatus current_status = {0};
-    
-    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) return 0.0f;
-    if (last_status.count == 0) {
-        last_status = current_status;
-        return 0.0f;
-    }
-    
-    uint64_t frame_diff = current_status.count - last_status.count;
-    uint64_t time_diff = current_status.processTime - last_status.processTime; 
-    last_status = current_status;
-    
-    if (time_diff == 0) return 0.0f;
-    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
 }
 
 // 被强行贴入游戏体内后的独立 1秒1次 图形改写常驻循环
