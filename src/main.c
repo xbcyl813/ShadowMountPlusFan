@@ -62,32 +62,6 @@ struct SceVideoOutFlipStatus {
 
 extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
 
-// 硬件监控子线程生命周期控制变量
-static volatile int g_hw_monitor_active = 1;
-
-// 免注入全局帧率物理倒推计算函数
-static float calculate_global_system_fps(void) {
-    static struct SceVideoOutFlipStatus last_status = {0};
-    struct SceVideoOutFlipStatus current_status = {0};
-    
-    // 句柄 1 代表 PS5 视频输出主通道 (Bus Main)
-    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) {
-        return 0.0f;
-    }
-    if (last_status.count == 0) {
-        last_status = current_status;
-        return 0.0f;
-    }
-    
-    uint64_t frame_diff = current_status.count - last_status.count;
-    uint64_t time_diff = current_status.processTime - last_status.processTime; // 微秒
-    
-    last_status = current_status;
-    
-    if (time_diff == 0) return 0.0f;
-    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
-}
-
 typedef struct {
   pthread_mutex_t reason_mutex;
   char reason[128];
