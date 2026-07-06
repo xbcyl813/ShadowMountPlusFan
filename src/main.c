@@ -1,9 +1,7 @@
 #include "sm_platform.h"
-
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/sysctl.h>
-
 #include "sm_runtime.h"
 #include "sm_types.h"
 #include "sm_log.h"
@@ -23,6 +21,7 @@
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
+#include <dlfcn.h>
 
 #ifndef SHADOWMOUNT_VERSION
 #define SHADOWMOUNT_VERSION "unknown"
