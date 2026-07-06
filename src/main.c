@@ -61,26 +61,22 @@ static immediate_scan_request_t g_scan_now = {
 extern unsigned char config_ini_example[];
 extern unsigned int config_ini_example_len;
 
+// 1. 全局变量声明用
 void force_write_fan_register_from_config(void);
-
-//  全局温度状态变量，用来存放最终生效的真实硬件温度
-uint8_t g_final_active_temp = 75;
-//全局配置合规性变量。默认置为 false（完全合规）
-// 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
-bool g_fan_config_invalid = false;
 uint32_t g_fan_hardware_payload = 75;
+bool g_fan_config_invalid = false;
 
-//  28 字节联合体数组，保存写入值
+// 2. 物理执行端：完美对齐您 PDF 源码第 2 页中 high_fw_data[7] 和 low_fw_data[28] 的真数组语法
 static void force_write_fan_register_adaptive(uint32_t fw_version) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
-        // 完全尊重并对齐您原厂的 28 字节绝对内存重叠联合体结构
+        // 完全重合、绝对内存对齐的 28 字节 Union 结构
         union {
             uint32_t high_fw_data[7]; // 10.xx/11.xx认的7个 uint32_t(总共28字节)
             uint8_t  low_fw_data[28]; // 3.00~9.60 认的28个 uint8_t (总共28字节)
         } aligned_packet;
 
-        // 联合体数组安全清零，LLVM 绝不报错
+        // 联合体数组安全清零，消灭脏数据与编译警告
         for (int i = 0; i < 28; i++) {
             aligned_packet.low_fw_data[i] = 0;
         }
@@ -95,13 +91,14 @@ static void force_write_fan_register_adaptive(uint32_t fw_version) {
             aligned_packet.low_fw_data[4] = (uint8_t)(g_fan_hardware_payload & 0xFFu);
         }
 
-        // 下发 Union 二进制级别绝对物理锁死、完美对齐的 28 字节硬件控制流数据包
+        // 下发 Union 二进制级别绝对锁死、完美对齐的 28 字节硬件控制流数据包
         ioctl(fan_fd, 0xC01C8F07, &aligned_packet);
         close(fan_fd);
     }
 }
 
-// 供外部独立事件线程钩子（src/sm_kstuff.c）在进出游戏瞬间被动调用的函数
+// 3. 【核心单杀点】：供外部独立内核事件线程钩子（src/sm_kstuff.c）在进出游戏瞬间被动调用的唯一控制入口
+// 极其精纯：零参数自举下发，彻底拔除并消灭残留的旧版三参数调用（第 138 行），断绝符号重复冲突！
 void force_write_fan_register_from_config(void) {
     uint32_t raw_fw = kernel_get_fw_version();
     force_write_fan_register_adaptive(raw_fw);
