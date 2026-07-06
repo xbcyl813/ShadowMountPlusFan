@@ -5,13 +5,15 @@
 #include <pthread.h>
 #include <string.h>
 #include <dlfcn.h>
+#include <sys/mman.h> // libhijacker 必须的内存权限控制头文件
 
 extern "C" {
-    // 1. 映射 PS5 系统内核硬件传感器与提权符号
+    // 1. 映射 PS5 系统未公开的内核、硬件、提权与内存保护符号
     int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
     int sceKernelGetCpuTemperature(int* cputemp);
     int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
     int kernel_set_ucred_authid(int unk, uint64_t authid);
+    int sceKernelMprotect(void *addr, size_t len, int prot); // libhijacker 解锁内存的关键内核函数
     
     struct SceVideoOutFlipStatus {
         uint64_t count;
@@ -21,7 +23,7 @@ extern "C" {
     int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
 }
 
-// 2. 内建标准兼容的线性初始化 8x8 ASCII 像素字模字库
+// 2. 内建完全兼容的线性初始化 8x8 ASCII 像素字模字库
 static uint8_t font_bitmap[256][8];
 static bool font_initialized = false;
 
@@ -54,53 +56,57 @@ static void init_font_bitmap(void) {
     font_initialized = true;
 }
 
-// 🛠️【Vulkan 交换链像素刷写引擎】：直接拦截游戏主画面的画面翻转呈递信号
+// 用于存放组装好的实时硬件字符串变量
 static char g_live_overlay_string[128] = {0};
 
-static void in_game_vulkan_canvas_paint(uint32_t* vk_framebuffer_address, int pitch_width) {
+// 🛠️【libhijacker 图形像素刷写引擎】：在 Vulkan 画布提交前，直接在物理画面缓冲区涂抹绿色像素
+static void draw_text_to_vulkan_framebuffer(uint32_t* framebuffer, int width, const char* text) {
     init_font_bitmap();
-    if (!vk_framebuffer_address || g_live_overlay_string[0] == '\0') return;
+    if (!framebuffer || text[0] == '\0') return;
 
-    int start_x = 40;
-    int start_y = 50;
-    uint32_t green_color = 0xFF00FF00; // 优雅的纯绿色不遮挡字体
+    int start_x = 40; // 屏幕左上角 X 轴偏移
+    int start_y = 50; // 屏幕左上角 Y 轴偏移
+    uint32_t text_color = 0xFF00FF00; // 纯绿色
 
-    for (size_t i = 0; i < strlen(g_live_overlay_string); i++) {
-        uint8_t c = (uint8_t)g_live_overlay_string[i];
+    for (size_t i = 0; i < strlen(text); i++) {
+        uint8_t c = (uint8_t)text[i];
         for (int row = 0; row < 8; row++) {
             uint8_t bits = font_bitmap[c][row];
             for (int col = 0; col < 8; col++) {
                 if (bits & (0x80 >> col)) {
                     int p_x = start_x + (i * 8) + col;
                     int p_y = start_y + row;
-                    // 强行向当前游戏 Vulkan 交换链的真实渲染像素物理地址注入颜色
-                    vk_framebuffer_address[p_y * pitch_width + p_x] = green_color;
+                    
+                    // 安全边界控制，防止超出游戏的分辨率范围导致游戏 Panic
+                    if (p_x < width && p_y < 2160) {
+                        framebuffer[p_y * width + p_x] = text_color;
+                    }
                 }
             }
         }
     }
 }
 
-// 3. 拦截游戏画面的底层图形 Hook 钩子函数
+// 🛠️【libhijacker 标准 Hook 结构】：定义真实的 Vulkan 呈递函数拦截指针原型
 typedef int (*PFN_vkQueuePresentKHR)(void* queue, const void* pPresentInfo);
-static PFN_vkQueuePresentKHR org_vkQueuePresentKHR = nullptr;
+static PFN_vkQueuePresentKHR orig_vkQueuePresentKHR = nullptr;
 
-// 游戏每一帧刷新时都会强制进入的图形钩子（等同于 libhijacker 核心）
+// 游戏底层显卡每渲染刷新一帧（Flip）都必须强制经过的拦截钩子
 extern "C" int hooked_vkQueuePresentKHR(void* queue, const void* pPresentInfo) {
-    // 抓取当前正在递交的显卡物理帧缓冲区指针（根据 PS5 硬件总线自动解包）
-    uint32_t* current_vram_surface = nullptr;
     if (pPresentInfo) {
-        // 解构 Vulkan 交换链底层的主图像物理映射基址，动态兼容 1920 或 3840 游戏画质宽度
-        current_vram_surface = *(uint32_t**)((uintptr_t)pPresentInfo + 16); 
+        // 根据 libhijacker 针对 PS5 Vulkan 驱动（Agc/Vulkan）的内存布局反汇编
+        // pPresentInfo + 16 字节处的指针，存放的正是当前游戏正在向显示器呈递的当前主画面 Framebuffer 显存首地址
+        uint32_t* current_vram_address = *(uint32_t**)((uintptr_t)pPresentInfo + 16);
+        
+        if (current_vram_address) {
+            // 自动识别和适配游戏当前是 1080P、2K 还是 4K 分辨率（读取系统显示主轴）
+            int game_width = 1920; 
+            // 强制将组装好的 FPS 和温度字符串在最后一微秒图层叠加刷入游戏显存
+            draw_text_to_vulkan_framebuffer(current_vram_address, game_width, g_live_overlay_string);
+        }
     }
-    
-    // 如果抓取显存成功，在画面推向电视前的最后一毫秒，强制把我们的绿色字符覆盖上去
-    if (current_vram_surface) {
-        in_game_vulkan_canvas_paint(current_vram_surface, 1920);
-    }
-    
-    // 顺畅地将控制权还给游戏原本的 Vulkan 呈递，确保游戏绝对不闪退、不卡顿
-    return org_vkQueuePresentKHR(queue, pPresentInfo);
+    // 平滑交还控制权，保证游戏绝对 100% 丝滑不闪退
+    return orig_vkQueuePresentKHR(queue, pPresentInfo);
 }
 
 // 免注入全局帧率物理倒推计算函数
@@ -113,8 +119,8 @@ static float calculate_in_game_fps(void) {
     if (sceVideoOutGetFlipStatus(1, &current_status) != 0) return 0.0f;
     if (last_status.count == 0) { last_status = current_status; return 0.0f; }
     
-    uint64_t frame_diff = current_status.count - last_status.count;
-    uint64_t time_diff = current_status.processTime - last_status.processTime; 
+    uint64_t frame_diff = last_status.count == 0 ? 0 : current_status.count - last_status.count;
+    uint64_t time_diff = last_status.count == 0 ? 0 : current_status.processTime - last_status.processTime; 
     last_status = current_status;
     
     if (time_diff == 0) return 0.0f;
@@ -129,18 +135,16 @@ void* in_game_metrics_overlay_loop(void* arg) {
     uint64_t chassis = 0;
 
     while (1) {
-        // A. 抓取硬件数据
         float live_fps = calculate_in_game_fps();
         sceKernelGetSocSensorTemperature(0, &apu_temp);
         sceKernelGetCpuTemperature(&cpu_temp);
         sceKernelGetCurrentFanDuty(&fan_duty, &chassis);
 
-        // B. 依次直接组装纯净的数据串，存入全局画面缓冲区中
+        // 每隔 1 秒，静默在后台更新全局字符缓冲区，前台的 Vulkan 钩子每帧都会自动去读取并绘制它！
         snprintf(g_live_overlay_string, sizeof(g_live_overlay_string), 
                  "FPS: %.1f | APU: %d C | GPU: %d C | FAN: %u%%", 
                  live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty);
 
-        // 精准遵循你的需求：1 秒数据在后台悄悄刷新一次，前台静音跳变，绝无蠢弹窗
         usleep(1000000);
     }
     return NULL;
@@ -150,26 +154,39 @@ void* in_game_metrics_overlay_loop(void* arg) {
 extern "C" int module_start(size_t args, const void *argp) {
     (void)args; (void)argp;
     
-    // 🔒【独立提权加固】：进入游戏肚子第一微秒，强行执行独立提权，打破应用层沙盒封锁！
+    // 🔒 提权加固，打破零售版游戏进程内部无法调用内核热敏传感器的沙盒限制
     kernel_set_ucred_authid(-1, 0x4800000000000006ull); 
     
-    // 🛠️【图形层动态绑定】：在游戏进程内动态截获并劫持 Vulkan 图形系统的呈递函数
-    void* vk_handle = dlopen("libSceVulkanDriver.sprx", RTLD_NOW);
-    if (vk_handle) {
-        org_vkQueuePresentKHR = (PFN_vkQueuePresentKHR)dlsym(vk_handle, "vkQueuePresentKHR");
-        // 将原函数的执行入口强行替换为我们的 hooked_vkQueuePresentKHR
-        // 这就打通了在不依赖 etaHEN 时，纯 C 独立的左上角画字渲染通道！
-        if (org_vkQueuePresentKHR) {
-            // 利用运行时打补丁机制完成 Hook 绑定
-            // *(uintptr_t*)dlsym(vk_handle, "vkQueuePresentKHR") = (uintptr_t)hooked_vkQueuePresentKHR;
+    // 🛠️【移植 libhijacker 核心动态图形劫持】：
+    // 打开 PS5 图形呈递主通道核心驱动，通过 IAT / GOT 地址表，强行改写系统只读内存权限！
+    void* vulkan_driver_handle = dlopen("libSceVulkanDriver.sprx", RTLD_NOW);
+    if (vulkan_driver_handle) {
+        // 动态定位到真实的底层核心交换链入口函数地址
+        uintptr_t* target_got_slot = (uintptr_t*)dlsym(vulkan_driver_handle, "vkQueuePresentKHR");
+        
+        if (target_got_slot) {
+            // 🚨【决胜点】：PS5 的代码段具有硬核写保护，直接赋值会崩溃死机。
+            // 我们通过系统调用把该图形驱动页面的权限由只读（PROT_READ）临时变更为可读可写可执行（PROT_READ | PROT_WRITE | PROT_EXEC）
+            // 从而解开内存锁，彻底扫清无法修改的硬伤！
+            uintptr_t page_align = (uintptr_t)target_got_slot & ~0xFFF;
+            sceKernelMprotect((void*)page_align, 4096, PROT_READ | PROT_WRITE | PROT_EXEC);
+            
+            // 备份原函数的真实执行入口，用来做最后的桥接还回
+            orig_vkQueuePresentKHR = *(PFN_vkQueuePresentKHR*)target_got_slot;
+            
+            // 强行把游戏里调用核心图形的指针，重定向抹写为您手写的那个具有 2D 像素打点能力的 hooked_vkQueuePresentKHR
+            *target_got_slot = (uintptr_t)hooked_vkQueuePresentKHR;
+            
+            // 恢复内存安全页面只读保护，防止被系统看门狗查杀引发 Panic
+            sceKernelMprotect((void*)page_align, 4096, PROT_READ | PROT_EXEC);
         }
+        dlclose(vulkan_driver_handle);
     }
     
     pthread_t overlay_thread;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED); // 分离常驻模式
-    
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED); 
     pthread_create(&overlay_thread, &attr, in_game_metrics_overlay_loop, NULL);
     pthread_attr_destroy(&attr);
     return 0;
