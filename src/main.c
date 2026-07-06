@@ -91,54 +91,6 @@ static float calculate_global_system_fps(void) {
     return ((float)frame_diff / (float)time_diff) * 1000000.0f;
 }
 
-// 独立的常驻后台监控守护进程主循环
-static void* hw_monitor_daemon_loop(void* arg) {
-    (void)arg;
-    int apu_temp = 0;
-    int cpu_temp = 0;
-    uint16_t current_fan_duty = 0;
-    uint64_t chassis_info = 0;
-    
-    // 初始化本地通信 Socket
-    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in target_addr;
-    memset(&target_addr, 0, sizeof(target_addr));
-    target_addr.sin_family = AF_INET;
-    target_addr.sin_port = htons(8899);                 // 外发给本地监听的 8899 端口
-    target_addr.sin_addr.s_addr = inet_addr("127.0.0.1"); // 本地环回地址
-
-    extern int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
-
-    while (g_hw_monitor_active && !g_stop_requested) {
-        // 1. 抓取实时帧率、APU温度、GPU温度、风扇状态
-        float current_fps = calculate_global_system_fps();
-        sceKernelGetSocSensorTemperature(0, &apu_temp); 
-        sceKernelGetCpuTemperature(&cpu_temp);          
-        
-        if (sceKernelGetCurrentFanDuty(&current_fan_duty, &chassis_info) != 0) {
-            current_fan_duty = 0; 
-        }
-        
-        // 2. 依次直接组装纯净的数据包字符串
-        char network_packet[64];
-        snprintf(network_packet, sizeof(network_packet),
-                 "FPS:%.1f|APU:%d|GPU:%d|FAN:%u",
-                 current_fps, cpu_temp, apu_temp, (unsigned int)current_fan_duty);
-        
-        // 3. 将最新状态推向本地的左上角 Overlay 显示层
-        if (sock_fd >= 0) {
-            sendto(sock_fd, network_packet, strlen(network_packet), 0, 
-                   (struct sockaddr*)&target_addr, sizeof(target_addr));
-        }
-
-        // 精准 1 秒刷新一次
-        sceKernelUsleep(1000000u);
-    }
-
-    if (sock_fd >= 0) close(sock_fd);
-    return NULL;
-}
-
 typedef struct {
   pthread_mutex_t reason_mutex;
   char reason[128];
