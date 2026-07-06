@@ -48,11 +48,6 @@ static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ============================================================================
-// 【全新加入】：独立常驻后台跨进程动态库注入符号前置声明
-// ============================================================================
-extern int sceKernelLoadStartModuleForPid(int pid, const char *path, size_t args_size, const void *args, int flags, void *unknown, int *res);
-
 // 独立的常驻后台监控守护进程主循环（天才延时版：完美错开高并发冲突）
 static void* smp_metrics_injector_daemon(void* arg) {
     (void)arg;
