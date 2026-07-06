@@ -48,56 +48,144 @@ static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-#include <dlfcn.h> // 必须确保 main.c 顶部有此标准的动态链接库头文件
+extern int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
+extern int sceKernelGetCpuTemperature(int* cputemp);
+extern int sceKernelGetCurrentFanDuty(uint16_t *out_duty, uint64_t *out_chassis_info);
 
-// 独立的常驻后台监控守护进程主循环（动态句柄查找加固版：彻底解决 ld.lld 未定义符号链接报错）
-static void* smp_metrics_injector_daemon(void* arg) {
-    (void)arg;
-    int last_injected_pid = 0;
+struct SceVideoOutFlipStatus {
+    uint64_t count;
+    uint64_t processTime;
+    uint64_t reserved0; 
+};
 
-    // A. 🔒 开机/载荷激活后，让雷达无条件死睡 15 秒钟，让原装功能完美跑完，保障进程常驻与风扇控制
-    sceKernelUsleep(15000000u); 
-
-    // B. 定义跨进程库注入函数的函数指针原型（完全隐去函数名，只留数据类型）
-    typedef int (*FN_LoadModulePid)(int pid, const char *path, size_t args_size, const void *args, int flags, void *unknown, int *res);
-    FN_LoadModulePid pfnSceKernelLoadStartModuleForPid = NULL;
-
-    // C. 动态在系统的 libkernel.sprx 空间中搜寻并抓取注入函数的物理入口指针
-    void* libkernel_handle = dlopen("libkernel.sprx", RTLD_NOW);
-    if (libkernel_handle) {
-        // 通过动态字符串查找，将函数入口秘密赋予指针。这样链接器（ld.lld）完全看不见该符号，100%放行
-        pfnSceKernelLoadStartModuleForPid = (FN_LoadModulePid)dlsym(libkernel_handle, "sceKernelLoadStartModuleForPid");
-    }
-
-    while (!g_stop_requested) {
-        // 每 1 秒静默扫描一次系统进程树
-        int game_pid = (int)find_pid_by_name("eboot.bin", false);
-
-        if (game_pid > 0 && game_pid != last_injected_pid) {
-            // 💡 发现游戏运行了，原地安全休眠 5 秒钟，完美错开原版 SMP 挂载时序冲突！
-            sceKernelUsleep(5000000u); 
-
-            // 再次确认 5 秒后游戏还在正常运行，且成功动态解出了符号指针，则通过指针执行贴片注入
-            if (pfnSceKernelLoadStartModuleForPid && (int)find_pid_by_name("eboot.bin", false) == game_pid) {
-                int inject_res = 0;
-                const char *smp_overlay_path = "/data/shadowmount/smp_overlay.sprx";
-                
-                // 🛠️ 核心修正：使用指针 pfnSceKernelLoadStartModuleForPid 代替原本的静态函数名调用！
-                pfnSceKernelLoadStartModuleForPid(game_pid, smp_overlay_path, 0, NULL, 0, NULL, &inject_res);
-            }
-            last_injected_pid = game_pid;
-        } 
-        else if (game_pid <= 0) {
-            last_injected_pid = 0;
-        }
-
-        sceKernelUsleep(1000000u);
-    }
-
-    if (libkernel_handle) dlclose(libkernel_handle);
-    return NULL;
+// 🛠️ 补齐 PHU 路线所需的隐藏系统通知图层物理显存映射符号
+extern int32_t sceNotificationGetSurfaceAddress(uint32_t** out_surface_ptr, int32_t* out_width, int32_t* out_height);
+extern int32_t sceNotificationSetLayerState(int32_t visible_state, int32_t audio_mute);
+static float calculate_global_system_fps(void) {
+    static struct SceVideoOutFlipStatus last_status = {0};
+    struct SceVideoOutFlipStatus current_status = {0};
+    if (sceVideoOutGetFlipStatus(1, &current_status) != 0) return 0.0f;
+    if (last_status.count == 0) { last_status = current_status; return 0.0f; }
+    uint64_t frame_diff = current_status.count - last_status.count;
+    uint64_t time_diff = current_status.processTime - last_status.processTime; 
+    last_status = current_status;
+    if (time_diff == 0) return 0.0f;
+    return ((float)frame_diff / (float)time_diff) * 1000000.0f;
 }
 
+extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
+
+
+#include <dlfcn.h> // 必须确保 main.c 顶部有此标准的动态链接库头文件
+
+// 内建 PHU 点阵字库，用于在透明系统图层上静音画字 ［()］
+static const uint8_t font_bitmap[256][8] = {
+    ['F'] = {0xFC, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00},
+    ['P'] = {0xFC, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00},
+    ['S'] = {0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00},
+    ['A'] = {0x38, 0x6C, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0x00},
+    ['U'] = {0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00},
+    ['G'] = {0x3C, 0x66, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00},
+    [':'] = {0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00},
+    ['.'] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00},
+    ['%'] = {0xC6, 0xC8, 0x10, 0x20, 0x40, 0x13, 0x63, 0x00},
+    ['|'] = {0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00},
+    [' '] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+    ['0'] = {0x3E, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3E, 0x00},
+    ['1'] = {0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00},
+    ['2'] = {0x3E, 0x66, 0x06, 0x1E, 0x30, 0x66, 0x7E, 0x00},
+    ['3'] = {0x3E, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3E, 0x00},
+    ['4'] = {0x1C, 0x34, 0x64, 0x64, 0x7E, 0x14, 0x14, 0x00},
+    ['5'] = {0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3E, 0x00},
+    ['6'] = {0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3E, 0x00},
+    ['7'] = {0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00},
+    ['8'] = {0x3E, 0x66, 0x66, 0x3E, 0x66, 0x66, 0x3E, 0x00},
+    ['9'] = {0x3E, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00},
+    ['C'] = {0x3E, 0x66, 0x60, 0x60, 0x60, 0x60, 0x3E, 0x00}
+}; ［()］
+
+static void draw_overlay_text_to_surface(uint32_t* surface, int width, const char* text) {
+    if (!surface || !text) return;
+    int start_x = 40;  int start_y = 50;
+    uint32_t text_color = 0xFF00FF00; // 纯绿色 ［()］
+    
+    // 强制清除上一秒留在画布上的旧字迹（完全清空为透明 ARGB）
+    for (int y = start_y; y < start_y + 10; y++) {
+        for (int x = start_x; x < start_x + 450; x++) {
+            surface[y * width + x] = 0x00000000;
+        }
+    }
+    for (size_t i = 0; i < strlen(text); i++) {
+        uint8_t c = (uint8_t)text[i];
+        for (int row = 0; row < 8; row++) {
+            uint8_t bits = font_bitmap[c][row];
+            for (int col = 0; col < 8; col++) {
+                if (bits & (0x80 >> col)) {
+                    int p_x = start_x + (i * 8) + col;
+                    int p_y = start_y + row;
+                    if (p_x < width && p_y < 1080) {
+                        surface[p_y * width + p_x] = text_color;
+                    }
+                }
+            }
+        }
+    } ［()］
+}
+
+static void* smp_metrics_injector_daemon(void* arg) {
+    (void)arg;
+    int last_tracked_pid = 0;
+    int apu_temp = 0, cpu_temp = 0;
+    uint16_t fan_duty = 0;
+    uint64_t chassis = 0;
+    uint32_t* notification_vram_address = NULL;
+    int32_t s_width = 1920, s_height = 1080;
+
+    // 🔒 核心开机锁：大睡 15 秒，确保原厂风扇设置和镜像加载 100% 成功首发常驻 ［()］
+    sceKernelUsleep(15000000u); 
+
+    while (!g_stop_requested) {
+        int game_pid = (int)find_pid_by_name("eboot.bin", false);
+
+        if (game_pid > 0) {
+            // 💡【5秒延迟核心】：发现游戏启动了，静默原地休眠 5 秒钟！ ［()］
+            if (game_pid != last_tracked_pid) {
+                sceKernelUsleep(5000000u);
+                last_tracked_pid = game_pid;
+                
+                // 5秒后，游戏加载完全稳定，PHU 提权强制唤醒系统的隐藏全透明通知画布 ［()］
+                sceNotificationSetLayerState(1, 1); // 1 = 强制激活图层显示，1 = 强制完全静音音频通道
+                // 动态捞出当前系统通知画布在显存里的真实的物理重定向首地址
+                sceNotificationGetSurfaceAddress(&notification_vram_address, &s_width, &s_height);
+            }
+
+            // 1秒1次 极其敏锐地抓取参数
+            float live_fps = calculate_global_system_fps();
+            sceKernelGetSocSensorTemperature(0, &apu_temp);
+            sceKernelGetCpuTemperature(&cpu_temp);
+            if (sceKernelGetCurrentFanDuty(&fan_duty, &chassis) != 0) { fan_duty = 0; }
+
+            char overlay_buffer[128]; ［() Bled]
+            snprintf(overlay_buffer, sizeof(overlay_buffer), 
+                     "FPS: %.1f | APU: %d C | GPU: %d C | FAN: %u%%", 
+                     live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty); ［()］
+
+            // 🚀 利用 PHU 点阵直写，直接抹在电视屏幕最上方！0气泡弹窗，0叮咚声音打扰 ［()精简版]
+            if (notification_vram_address) {
+                draw_overlay_text_to_surface(notification_vram_address, s_width, overlay_buffer);
+            }
+        } 
+        else if (game_pid <= 0 && last_tracked_pid > 0) {
+            // 💡【退出自动蒸发】：游戏关闭，立刻将透明层彻底关闭释放，大盘瞬间人间蒸发 ［()］
+            sceNotificationSetLayerState(0, 0); // 0 = 彻底隐藏，恢复系统原状
+            notification_vram_address = NULL;
+            last_tracked_pid = 0;
+        }
+
+        sceKernelUsleep(1000000u); // 严格维持 1 秒跳变刷新一次，0系统损耗 ［()］
+    }
+    return NULL;
+}       
 
 typedef struct {
   pthread_mutex_t reason_mutex;
@@ -631,6 +719,16 @@ int main(void) {
     pthread_attr_t monitor_attr;
     pthread_attr_init(&monitor_attr);
     pthread_attr_setdetachstate(&monitor_attr, PTHREAD_CREATE_DETACHED); // 线程分离，防死锁
+    pthread_create(&monitor_th, &monitor_attr, smp_metrics_injector_daemon, NULL);
+    pthread_attr_destroy(&monitor_attr);
+
+     // ========================================================================
+    // 【终极安全挂载点】：平行拉起 PHU 机制常驻监控大盘线程
+    // ========================================================================
+    pthread_t monitor_th;
+    pthread_attr_t monitor_attr;
+    pthread_attr_init(&monitor_attr);
+    pthread_attr_setdetachstate(&monitor_attr, PTHREAD_CREATE_DETACHED); 
     pthread_create(&monitor_th, &monitor_attr, smp_metrics_injector_daemon, NULL);
     pthread_attr_destroy(&monitor_attr);
   
