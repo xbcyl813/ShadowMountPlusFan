@@ -82,25 +82,47 @@ static void force_write_fan_register(uint8_t target_temp) {
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
     uint32_t target_temp = runtime_config()->target_temp;
-
-   // 默认认为用户的配置是合规的
     g_fan_config_invalid = false;
-  
-   // 判断参数值是否为空，如果是空值，取默认值 75 度
-     if (target_temp == 0u) {
-         target_temp = 75u;
-         g_fan_config_invalid = true;
-      }
-   // 基础的边界安全限幅，将温度阈值控制在60到85度之间。
+
+    // 通用的空值与 60~85 度物理越界安全限幅判定
+    if (target_temp == 0u) {
+        target_temp = 75u;
+        g_fan_config_invalid = true;
+    }
     else if (target_temp < 60u || target_temp > 85u) {
         target_temp = 75u;
-        g_fan_config_invalid = true; 
-       }  
+        g_fan_config_invalid = true;
+    }
 
-  // 将最终温度阈值赋予全局变量
+    // 将合法验证后的温度数值写入全局变量
     g_final_active_temp = (uint8_t)target_temp;
-  
-   force_write_fan_register(g_final_active_temp);
+
+    // ====== 【根据系统真实固件版本进行硬件 Payload 换算分流】 ======
+    // 原厂定义的全局固件版本掩码，例如 4.03 为 0x04030000u，9.00 为 0x09000000u
+    // 如果原厂结构体里写的是别的名字，如 runtime_config()->fw_version 或类似，一字对齐替换即可
+    uint32_t fw_version = g_fw_version; 
+
+    // 【特殊处理：早期固件熔断拦截】
+    // 固件低于 3.00 时强写会导致硬件总线彻底崩溃，必须 100% 拒绝执行
+    if (fw_version < 0x03000000u) {
+        log_debug(" [FAN] Fan control aborted: firmware below 3.00 is unsafe.");
+        return; 
+    }
+
+    uint8_t final_hardware_payload = g_final_active_temp;
+
+    // 【特殊处理：10.xx / 11.xx 高版本占空比分流】
+    // 如果系统版本大于等于 10.00 (即 0x10000000u)
+    if (fw_version >= 0x10000000u) {
+        // 黄金递减映射公式：将用户设定的 (60~85) 摄氏度，转换为 10.xx/11.xx 认得的 (30~45) 变频控制字
+        // 摄氏度越低(要求狂飙降温) ➔ 下发数字越大(接近45占空比)
+        // 摄氏度越高(容忍高发热)   ➔ 下发数字越小(接近30占空比，恢复静音)
+        final_hardware_payload = 45u - ((g_final_active_temp - 60u) * 3u / 5u);
+    }
+    // 【3.00~9.60 固件保持直通模式，final_hardware_payload 直接等于用户的摄氏度，不作任何修改】
+
+    // 2. 硬件物理下发：完美的版本自适应数字打入南桥
+    force_write_fan_register(final_hardware_payload);
 }
 
 static void on_signal(int sig) {
