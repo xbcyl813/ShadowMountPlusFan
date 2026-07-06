@@ -127,7 +127,6 @@ static void* hw_monitor_daemon_loop(void* arg) {
             notify_system(monitor_msg);
             notify_timer = 0;
         }
-
         // 休眠 500 毫秒，1 秒轮询两次
         sceKernelUsleep(500000u);
     }
