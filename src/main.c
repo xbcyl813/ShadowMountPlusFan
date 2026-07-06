@@ -79,12 +79,39 @@ static void force_write_fan_register(uint8_t target_temp) {
     }
 }
 
+// 内部彻底根据固件版本，动态改变 28 字节数据包的物理排布！
+static void force_write_fan_register_adaptive(uint32_t fw_version, uint8_t raw_temp, uint32_t calculated_duty) {
+    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
+    if (fan_fd > 0) {
+        // 声明一个通用的 28 字节原始缓冲区，全清零保底
+        uint8_t packet_buf[28] = {0};
+        uint32_t major_version = (fw_version >> 24) & 0xFFu;
+
+        if (major_version >= 0x10u) {
+            // 【10.xx / 11.xx 高版本固件语境对齐】：
+            // 把计算出的占空比控制字（如 41），以 32位无符号整数形式，强行塞进整个数据包的【最前排前 4 字节】
+            packet_buf[0] = (uint8_t)(calculated_duty & 0xFFu);
+            packet_buf[1] = (uint8_t)((calculated_duty >> 8) & 0xFFu);
+            packet_buf[2] = (uint8_t)((calculated_duty >> 16) & 0xFFu);
+            packet_buf[3] = (uint8_t)((calculated_duty >> 24) & 0xFFu);
+        } else {
+            // 【3.00 ~ 9.60 低版本固件语境对齐】：
+            // 完美保留直通摄氏度模式，把原始的温度数字（如 75）规规矩矩地印在数据包的【第 5 个字节（索引4）】上！
+            packet_buf[4] = raw_temp;
+        }
+
+        // 下发经过底层物理结构自适应重组后的 28 字节完美数据包
+        ioctl(fan_fd, 0xC01C8F07, packet_buf);
+        close(fan_fd);
+    }
+}
+
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
     uint32_t target_temp = runtime_config()->target_temp;
     g_fan_config_invalid = false;
 
-    //  通用的空值与 60~85 度物理越界安全限幅判定
+    // 第一关：通用的空值与 60~85 度物理越界安全限幅判定
     if (target_temp == 0u) {
         target_temp = 75u;
         g_fan_config_invalid = true;
@@ -94,36 +121,24 @@ void force_write_fan_register_from_config(void) {
         g_fan_config_invalid = true;
     }
 
-    // 将合法验证后的温度数值写入全局变量
+    // 全局变量保存真实的摄氏度（让 main 函数的弹窗无论在什么固件上都永远只显示正宗的摄氏度）
     g_final_active_temp = (uint8_t)target_temp;
 
-    // ====== 【调用原厂函数进行硬件 Payload 换算分流】 ======
-    // 【核心对齐点】：直接调用原厂完全存在的底层内核固件获取函数！
-    uint32_t raw_fw = kernel_get_fw_version(); 
-    
-    // 提取高 8 位的大版本号（例如 9.00 固件提取出来是 0x09，11.00 固件提取出来是 0x11）
+    // 获取原厂 100% 存在的底层内核固件版本号
+    uint32_t raw_fw = kernel_get_fw_version();
     uint32_t major_version = (raw_fw >> 24) & 0xFFu;
 
-    // 【早期 3.00 以下固件熔断拦截】
+    // 【熔断拦截】：远古 3.00 以下固件拒绝执行，保护硬件
     if (major_version < 0x03u) {
-        log_debug(" [FAN] Fan control aborted: firmware below 3.00 is unsafe.");
-        return; 
+        return;
     }
 
-    uint8_t final_hardware_payload = g_final_active_temp;
+    // 计算出针对 10.xx / 11.xx 固件绝对不溢出、最安静的 41u 占空比控制字
+    uint32_t high_fw_duty = 50u - ((g_final_active_temp - 60u) * 3u / 5u);
 
-    // 【10.xx / 11.xx 及以上高版本占空比分流】
-    // 只要大版本号大于等于 0x10（即 10 进制的 16，代表 10.00 固件及以上）
-    if (major_version >= 0x10u) {
-        // 递减映射公式：将用户设定的 (60~85) 摄氏度，转换为 10.xx/11.xx 认得的 (30~45) 变频占空比控制字
-        // 摄氏度越低(要求狂飙降温) ➔ 下发数字越大(接近45占空比)
-        // 摄氏度越高(容忍高发热)   ➔ 下发数字越小(接近30占空比，恢复静音)
-        final_hardware_payload = 45u - ((g_final_active_temp - 60u) * 3u / 5u);
-    }
-    // 【3.00~9.60 固件保持直通模式，final_hardware_payload 直接等于用户的摄氏度，不作任何修改】
-
-    // 3. 硬件物理下发：完美的版本自适应数字打入南桥
-    force_write_fan_register(final_hardware_payload);
+    // 调用我们在上面写好的、被赋予了灵魂的动态自适应执行端！
+    // 跨越文件和固件版本的阻隔，把 1) 原始固件号、2) 原始摄氏度、3) 高版本占空比 联合打包喂过去
+    force_write_fan_register_adaptive(raw_fw, g_final_active_temp, high_fw_duty);
 }
 
 static void on_signal(int sig) {
