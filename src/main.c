@@ -40,6 +40,7 @@
 //#define AUTHID_BASE 0x4801000000000013L
 #define AUTHID_BASE 0x4800000000000006ull
 
+
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
 static atomic_bool g_runtime_sleep_mode_active = false;
@@ -515,12 +516,12 @@ int main(void) {
     force_write_fan_register_from_config();
     // 弹窗显示最终生效的温度阈值
     if (g_fan_config_invalid) {
-        // 配置超出范围或写漏，两行警告
+        // 如果用户的配置超出范围或写漏，连续飘出两行警告，彻底打消用户的疑惑
         notify_system("Warning: Fan config out of safe range (60-85°C)!");
         sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
         notify_system("Default threshold adopted: %d°C!", (int)g_final_active_temp);
     } else {
-        // 配置合法，标准成功气泡
+        // 如果用户的配置完全合法，则清爽平滑地飘出标准成功气泡
         notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
     }
     sceKernelUsleep(2000000u);
