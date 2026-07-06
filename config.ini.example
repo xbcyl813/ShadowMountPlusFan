@@ -146,4 +146,4 @@
 ## scanpath=/data/etaHEN/games
 
 #[FanControl] default 75°C
-#target_temp = 75
+target_temp = 75
