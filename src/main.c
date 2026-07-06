@@ -76,7 +76,7 @@ static float calculate_global_system_fps(void) {
     return ((float)frame_diff / (float)time_diff) * 1000000.0f;
 }
 
-// 内建简易 8x8 ASCII 像素点阵字库字模，用于直接在独立透明悬浮层上画字，0图形库依赖
+// 内建简易 8x8 ASCII 像素点阵字库字模，用于直接在独立透明层上画字（对齐维度）
 static const uint8_t font_bitmap[256][8] = {
     ['F'] = {0xFC, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00},
     ['P'] = {0xFC, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00},
