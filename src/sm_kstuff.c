@@ -800,7 +800,7 @@ void sm_kstuff_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id,
     // ========================================================================
     if (pid > 0) {
         int inject_res = 0;
-        const char *smp_overlay_path = "/data/smp_overlay.sprx"; // 存放于 PS5 内置硬盘的 2D 渲染补丁
+        const char *smp_overlay_path = "/data/shadowmount/smp_overlay.sprx"; // 存放于 PS5 内置硬盘的 2D 渲染补丁
         sceKernelLoadStartModuleForPid(pid, smp_overlay_path, 0, NULL, 0, NULL, &inject_res);
     }
 }
