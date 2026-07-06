@@ -47,21 +47,6 @@ static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ============================================================================
-// 温度监控变量
-// ============================================================================
-extern int sceKernelGetSocSensorTemperature(int sensorId, int* soctime);
-extern int sceKernelGetCpuTemperature(int* cputemp);
-
-// 视频输出底层结构体，用于全系统免注入 FPS 捕获
-struct SceVideoOutFlipStatus {
-    uint64_t count;
-    uint64_t processTime;
-    uint64_t reserved0; 
-};
-
-extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
-
 typedef struct {
   pthread_mutex_t reason_mutex;
   char reason[128];
