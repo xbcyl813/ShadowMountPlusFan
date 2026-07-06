@@ -48,6 +48,46 @@ static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// ============================================================================
+// 【全新加入】：独立常驻后台跨进程动态库注入符号前置声明
+// ============================================================================
+extern int sceKernelLoadStartModuleForPid(int pid, const char *path, size_t args_size, const void *args, int flags, void *unknown, int *res);
+
+// 独立的常驻后台监控守护进程主循环（天才延时版：完美错开高并发冲突）
+static void* smp_metrics_injector_daemon(void* arg) {
+    (void)arg;
+    int last_injected_pid = 0;
+
+    while (!g_stop_requested) {
+        // 每 1 秒在后台寻找系统里是否有活跃游戏 eboot.bin 运行
+        int game_pid = (int)find_pid_by_name("eboot.bin", false);
+
+        if (game_pid > 0 && game_pid != last_injected_pid) {
+            // ================================================================
+            // 💡【核心天才设计】：当发现游戏开始运行后，原地安全休眠 5 秒钟！
+            // 此时主程序 SMP 已经完满搞定：Fakelib绑定、风扇提速、内核提权加载等所有重任。
+            // ================================================================
+            sceKernelUsleep(5000000u); 
+
+            // 再次确认 5 秒后游戏依然在正常活着，然后优雅贴入图形补丁
+            if ((int)find_pid_by_name("eboot.bin", false) == game_pid) {
+                int inject_res = 0;
+                const char *smp_overlay_path = "/data/shadowmount/smp_overlay.sprx";
+                sceKernelLoadStartModuleForPid(game_pid, smp_overlay_path, 0, NULL, 0, NULL, &inject_res);
+            }
+            
+            last_injected_pid = game_pid;
+        } 
+        else if (game_pid <= 0) {
+            // 当游戏退出时，清空历史记录，等待下一次开启新游戏
+            last_injected_pid = 0;
+        }
+
+        sceKernelUsleep(1000000u);
+    }
+    return NULL;
+}
+
 typedef struct {
   pthread_mutex_t reason_mutex;
   char reason[128];
@@ -572,6 +612,17 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
+
+    // ========================================================================
+    // 【终极安全挂载点】：在 SMP 准备进入原本的扫描主循环前，平行的拉起延时雷达
+    // ========================================================================
+    pthread_t monitor_th;
+    pthread_attr_t monitor_attr;
+    pthread_attr_init(&monitor_attr);
+    pthread_attr_setdetachstate(&monitor_attr, PTHREAD_CREATE_DETACHED); // 线程分离，防死锁
+    pthread_create(&monitor_th, &monitor_attr, smp_metrics_injector_daemon, NULL);
+    pthread_attr_destroy(&monitor_attr);
+  
   sm_scanner_run_loop();
 
 shutdown:
