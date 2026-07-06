@@ -7,5 +7,5 @@ asm(".global \"C49jelxiaVE\"\n"
 asm(".global sceKernelLoadStartModuleForPid\n"
     ".type sceKernelLoadStartModuleForPid @function\n"
     "sceKernelLoadStartModuleForPid:\n"
-    "    jmp [rip + sceKernelLoadStartModuleForPid@GOTPCREL]\n");
+    "    jmp sceKernelLoadStartModuleForPid@PLT\n");
 
