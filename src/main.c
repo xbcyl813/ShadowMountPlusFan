@@ -79,15 +79,17 @@ static void force_write_fan_register(uint8_t target_temp) {
     }
 }
 
-// 物理执行端：利用联合体锁死 28 字节物理内存
+//  28 字节联合体数组，保存写入值
 static void force_write_fan_register_adaptive(uint32_t fw_version) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
+        // 利用标准 Union 语法，强行让高版本的 uint32_t 数组和低版本的 uint8_t 数组共享同一块绝对重叠的 28 字节物理内存
         union {
-            uint32_t high_fw_data; // 10.xx/11.xx 认的前排 4 字节
-            uint8_t  low_fw_data; // 3.00~9.60 认的第 5 字节
+            uint32_t high_fw_data[7]; // 10.xx/11.xx 认的 7 个 uint32_t (总共 28 字节)
+            uint8_t  low_fw_data[28]; // 3.00~9.60 认的 28 个 uint8_t  (总共 28 字节)
         } aligned_packet;
 
+        // 联合体数组安全清零
         for (int i = 0; i < 28; i++) {
             aligned_packet.low_fw_data[i] = 0;
         }
@@ -95,20 +97,20 @@ static void force_write_fan_register_adaptive(uint32_t fw_version) {
         uint32_t major_version = (fw_version >> 24) & 0xFFu;
 
         if (major_version >= 0x10u) {
-            // 【10.xx / 11.xx 高版本】：把经过安全换算、个位数的黄金 3 挡绝对锁死在前排 4 字节
-            // 10.01 固件进门摸到 3u（代表3挡），不溢出、不暴走、机器瞬间恢复极度绝对安静！
-            aligned_packet.high_fw_data = g_fan_hardware_payload;
+            // 【10.xx / 11.xx 高版本】：把安全换算好的个位数黄金 3 挡（如 3u）放在最前排前 4 字节
+            aligned_packet.high_fw_data[0] = g_fan_hardware_payload;
         } else {
-            // 【3.00 ~ 9.60 低版本（包含 4.03, 7.61, 9.00）】：原始 75 摄氏度稳稳印在第 5 字节上，完美兼容
-            aligned_packet.low_fw_data = (uint8_t)(g_fan_hardware_payload & 0xFFu);
+            // 【3.00 ~ 9.60 低版本（包含 4.03, 7.61, 9.00）】：原始温度摄氏度（如 75）放在在第 5 个字节（索引4）上
+            aligned_packet.low_fw_data[4] = (uint8_t)(g_fan_hardware_payload & 0xFFu);
         }
 
+        // 下发 Union 二进制级别绝对锁死、完美对齐的 28 字节硬件控制流数据包
         ioctl(fan_fd, 0xC01C8F07, &aligned_packet);
         close(fan_fd);
     }
 }
 
-// 供外部独立内核线程钩子（src/sm_kstuff.c）在进出游戏瞬间被动调用的函数
+// 供外部独立事件线程钩子（src/sm_kstuff.c）在进出游戏瞬间被动调用的函数
 void force_write_fan_register_from_config(void) {
     uint32_t raw_fw = kernel_get_fw_version();
     force_write_fan_register_adaptive(raw_fw);
@@ -553,10 +555,10 @@ int main(void) {
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
 
-    // ====== 【风扇冷启动初始化：全局唯一计算源中心】 ======
+    // ====== 【风扇守护修改点：冷启动初始化与全局唯一计算】 ======
     sceKernelUsleep(2000000u); // 转换前等待 2 秒
 
-    // 1. 在开机唯一安全的时刻，只读一次原厂结构体数值，防范时序挂起
+    // 1. 在加载时，读一次原厂结构体数值
     uint32_t target_temp = runtime_config()->target_temp;
     g_fan_config_invalid = false;
 
@@ -565,14 +567,13 @@ int main(void) {
         g_fan_config_invalid = true;
     }
 
-    // 2. 现场对接固件版本，提前将硬件控制字算好并刻进全局变量中
+    // 对接固件版本，提前将硬件控制字算好并刻进全局变量中
     uint32_t raw_fw = kernel_get_fw_version();
     uint32_t major_version = (raw_fw >> 24) & 0xFFu;
 
     if (major_version >= 0x10u) {
-        // 【10.01 ~ 11.xx 终极防溢出公式】：采用最标准的个位数硬件挡位映射！
-        // 摄氏度越高 ➔ 挡位越低；默认 75°C 带入计算：5u - ((75u - 60u) / 6u) = 5 - 2 = 3u！
-        // 算出的 3u 代表 10.01 和 10.6 固件最爱、最承认、绝不溢出暴走的“黄金 3 挡”静音主频率！
+        // 【10.01 ~ 11.xx 终极防溢出公式】：采用最标准的个位数硬件挡位映射
+        // 默认 75°C 带入计算：5u - ((75u - 60u) / 6u) = 5 - 2 = 3u
         uint32_t calculated_gear = 5u - ((target_temp - 60u) / 6u);
         if (calculated_gear < 1u) calculated_gear = 1u;
         if (calculated_gear > 5u) calculated_gear = 5u;
@@ -582,12 +583,12 @@ int main(void) {
         g_fan_hardware_payload = target_temp; // 低版本保持直通摄氏度数字（如75）到全局变量
     }
 
-    // 3. 让初次变速立即生效
+    // 零参数自举调用
     if (major_version >= 0x03u) {
-        force_write_fan_register_adaptive(raw_fw);
+        force_write_fan_register_from_config();
     }
 
-    // 4. 精准且无错的分支弹窗反馈
+    // 精准分支弹窗反馈
     if (g_fan_config_invalid) {
         notify_system("Warning: Fan config out of safe range (60-85°C)!");
         sceKernelUsleep(1500000u);
