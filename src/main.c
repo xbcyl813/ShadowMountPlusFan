@@ -615,17 +615,6 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
-
-    // ========================================================================
-    // 【精准挂载点】：在这里初始化并启动我们的常驻独立硬件监控子线程
-    // ========================================================================
-    pthread_t smp_metrics_thread;
-    pthread_attr_t smp_metrics_attr;
-    pthread_attr_init(&smp_metrics_attr);
-    pthread_attr_setdetachstate(&smp_metrics_attr, PTHREAD_CREATE_DETACHED); // 设置为分离模式避免常驻死锁
-    pthread_create(&smp_metrics_thread, &smp_metrics_attr, hw_monitor_daemon_loop, NULL);
-    pthread_attr_destroy(&smp_metrics_attr);
-  
   sm_scanner_run_loop();
 
 shutdown:
