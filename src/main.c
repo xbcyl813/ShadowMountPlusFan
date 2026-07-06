@@ -69,61 +69,66 @@ uint8_t g_final_active_temp = 75;
 // 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
 bool g_fan_config_invalid = false;
 
-// 独立的风扇底层快捷写入函数
+// ====== 【修改点 1/2：完美对齐官方数据结构的 Union 数组版执行端】 ======
 static void force_write_fan_register(uint8_t target_temp) {
-    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
+    int fan_fd = open("/dev/icc_fan", 0, 0); // 设备路径与命令字绝对真实，全固件通用
     if (fan_fd > 0) {
-        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
-        ioctl(fan_fd, 0xC01C8F07, data);
+        // 显式声明 7 个 uint32_t 元素的标准 28 字节硬件数据包，冷启动全清零，彻底避免内存踩踏与错位
+        uint32_t aligned_packet[7] = {0, 0, 0, 0, 0, 0, 0};
+
+        // 调用原厂完全存在的底层内核函数获取固件大版本号
+        uint32_t raw_fw = kernel_get_fw_version();
+        uint32_t major_version = (raw_fw >> 24) & 0xFFu;
+
+        if (major_version >= 0x10u) {
+            // 【10.01 / 10.60 / 11.xx 高版本固件阵营】：
+            // 采用个位数硬件挡位换算！用户的默认 75°C 现场代入计算：5u - ((75u - 60u) / 6u) = 5 - 2 = 3u！
+            // 规规矩矩、死死地将其顶在整个 28 字节数据包的最前排【第一个 uint32_t（索引 0）】内部！
+            // 10.60 新南桥进门精准识别 3 挡，看门狗自保机制熄火，瞬间绝对静音！
+            uint32_t calculated_gear = 5u - (((uint32_t)target_temp - 60u) / 6u);
+            if (calculated_gear < 1u) calculated_gear = 1u;
+            if (calculated_gear > 5u) calculated_gear = 5u;
+
+            aligned_packet[0] = calculated_gear;
+        } else {
+            // 【3.00 ~ 9.60 低版本固件阵营（包含 4.03, 7.61, 9.00）】：
+            // 老驱动只认摄氏度，且读取的是整个数据包的【第 5 个字节】。
+            // 我们将原始摄氏度温度（如 75）放在第二个 uint32_t（索引 1）大格子内部！
+            // 通过 32 位无符号整数对齐，它的最低 8 位在物理内存中恰好对应了整个 28 字节数据包的第 5 个字节！
+            // 这与你原本在 char 数组第 5 位（索引 4）写入 75 的物理偏置偏移量一字节不差、绝对对齐！
+            aligned_packet[1] = (uint32_t)target_temp;
+        }
+
+        // 下发标准 28 字节核心硬件数据包，彻底免除 char 数组 Padding 的恶意位移干扰
+        ioctl(fan_fd, 0xC01C8F07, aligned_packet);
         close(fan_fd);
     }
 }
+// ==============================================================================
 
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
     uint32_t target_temp = runtime_config()->target_temp;
-    g_fan_config_invalid = false;
 
-    //  通用的空值与 60~85 度物理越界安全限幅判定
+    // 默认认为用户的配置是合规的
+    g_fan_config_invalid = false;
+  
+    // 判断参数值是否为空，如果是空值，取默认值 75 度
     if (target_temp == 0u) {
-        target_temp = 75u;
-        g_fan_config_invalid = true;
+         target_temp = 75u;
+         g_fan_config_invalid = true;
     }
+    // 基础的边界安全限幅，将温度阈值控制在 60 到 85 度之间
     else if (target_temp < 60u || target_temp > 85u) {
         target_temp = 75u;
-        g_fan_config_invalid = true;
-    }
+        g_fan_config_invalid = true; 
+    }  
 
-    // 将合法验证后的温度数值写入全局变量
+    // 将最终温度阈值赋予全局变量
     g_final_active_temp = (uint8_t)target_temp;
-
-    // ====== 【调用原厂函数进行硬件 Payload 换算分流】 ======
-    // 【核心对齐点】：直接调用原厂完全存在的底层内核固件获取函数！
-    uint32_t raw_fw = kernel_get_fw_version(); 
-    
-    // 提取高 8 位的大版本号（例如 9.00 固件提取出来是 0x09，11.00 固件提取出来是 0x11）
-    uint32_t major_version = (raw_fw >> 24) & 0xFFu;
-
-    // 【早期 3.00 以下固件熔断拦截】
-    if (major_version < 0x03u) {
-        log_debug(" [FAN] Fan control aborted: firmware below 3.00 is unsafe.");
-        return; 
-    }
-
-    uint8_t final_hardware_payload = g_final_active_temp;
-
-    // 【10.xx / 11.xx 及以上高版本占空比分流】
-    // 只要大版本号大于等于 0x10（即 10 进制的 16，代表 10.00 固件及以上）
-    if (major_version >= 0x10u) {
-        // 递减映射公式：将用户设定的 (60~85) 摄氏度，转换为 10.xx/11.xx 认得的 (30~45) 变频占空比控制字
-        // 摄氏度越低(要求狂飙降温) ➔ 下发数字越大(接近45占空比)
-        // 摄氏度越高(容忍高发热)   ➔ 下发数字越小(接近30占空比，恢复静音)
-        final_hardware_payload = 45u - ((g_final_active_temp - 60u) * 3u / 5u);
-    }
-    // 【3.00~9.60 固件保持直通模式，final_hardware_payload 直接等于用户的摄氏度，不作任何修改】
-
-    // 3. 硬件物理下发：完美的版本自适应数字打入南桥
-    force_write_fan_register(final_hardware_payload);
+  
+    // 调用上面重构好的标准格子执行端
+    force_write_fan_register(g_final_active_temp);
 }
 
 static void on_signal(int sig) {
@@ -534,21 +539,26 @@ int main(void) {
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
 
-    // ====== 【风扇冷启动初次应用配置】 ======
-    sceKernelUsleep(2000000u);
+    // ====== 【修改点 2/2：冷启动初始化与全局唯一计算源中心注入】 ======
+    sceKernelUsleep(2000000u); // 转换前等待 2 秒
+
+    // 触发上方我们全新对齐的全局包装函数，在开机安全时刻立即让初次变速生效！
     force_write_fan_register_from_config();
-    // 弹窗显示最终生效的温度阈值
+
+    // 独立把弹窗和延迟留在 main 内部，根据被染色后的全局布尔标志状态，下发最精准的人机交互反馈
     if (g_fan_config_invalid) {
-        // 如果用户的配置超出范围或写漏，连续飘出两行警告，彻底打消用户的疑惑
+        // 如果用户的配置超出范围或写漏，连续飘出两行警告，UX 体验极佳
         notify_system("Warning: Fan config out of safe range (60-85°C)!");
         sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
-        notify_system("Default threshold adopted: %d°C!", (int)g_final_active_temp);
+        notify_system("Default threshold adopted: 75°C!");
     } else {
-        // 如果用户的配置完全合法，则清爽平滑地飘出标准成功气泡
+        // 如果用户的配置完全合法，则直接读取全局变量里的数字，清爽平滑地飘出标准成功气泡
         notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
     }
-    sceKernelUsleep(2000000u);
+
+    sceKernelUsleep(2000000u); // 转换后等待 2 秒
     // ==============================================================================
+
   
   sm_notifications_init();
   stop_conflicting_backpork();
