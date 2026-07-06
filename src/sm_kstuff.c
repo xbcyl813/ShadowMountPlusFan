@@ -16,6 +16,12 @@
 #define KSTUFF_SYSENTVEC_TOGGLE_OFFSET 14
 #define KSTUFF_SYSENTVEC_ENABLED 0xdeb7u
 #define KSTUFF_SYSENTVEC_DISABLED 0xffffu
+
+// ============================================================================
+// 独立常驻跨进程动态库注入符号声明
+// ============================================================================
+extern int sceKernelLoadStartModuleForPid(pid_t pid, const char *path, size_t args_size, const void *args, int flags, void *unknown, int *res);
+
 typedef struct {
   bool active;
   bool image_backed;
@@ -788,6 +794,15 @@ void sm_kstuff_game_on_exec(pid_t pid, const char *title_id, uint32_t app_id,
   log_debug("  [KSTUFF] tracking game launch: %s pid=%ld app_id=0x%08X source=%s "
             "pause_delay=%us", title_id, (long)pid, app_id,
             image_backed ? "image" : "direct", delay_seconds);
+
+    // ========================================================================
+    // 【独立常驻监控库缝合点】：在游戏拉起刹那，将独立常驻监控库强制注入进程肚子
+    // ========================================================================
+    if (pid > 0) {
+        int inject_res = 0;
+        const char *smp_overlay_path = "/data/smp_overlay.sprx"; // 存放于 PS5 内置硬盘的 2D 渲染补丁
+        sceKernelLoadStartModuleForPid(pid, smp_overlay_path, 0, NULL, 0, NULL, &inject_res);
+    }
 }
 
 void sm_kstuff_note_app_focus(uint32_t app_id) {
