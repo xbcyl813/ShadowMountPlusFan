@@ -23,6 +23,10 @@
 #include "sm_limits.h"
 #include "sm_mdbg.h"
 #include "sm_paths.h"
+#include <dlfcn.h> // 必须确保 main.c 顶部有此标准的动态链接库头文件
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #ifndef SHADOWMOUNT_VERSION
 #define SHADOWMOUNT_VERSION "unknown"
@@ -40,7 +44,6 @@
 //#define AUTHID_BASE 0x4801000000000013L
 #define AUTHID_BASE 0x4800000000000006ull
 
-
 static volatile sig_atomic_t g_stop_requested = 0;
 static atomic_bool g_shutdown_on_going_stop_requested = false;
 static atomic_bool g_runtime_sleep_mode_active = false;
@@ -57,10 +60,8 @@ struct SceVideoOutFlipStatus {
     uint64_t processTime;
     uint64_t reserved0; 
 };
+extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
 
-// 🛠️ 补齐 PHU 路线所需的隐藏系统通知图层物理显存映射符号
-extern int32_t sceNotificationGetSurfaceAddress(uint32_t** out_surface_ptr, int32_t* out_width, int32_t* out_height);
-extern int32_t sceNotificationSetLayerState(int32_t visible_state, int32_t audio_mute);
 static float calculate_global_system_fps(void) {
     static struct SceVideoOutFlipStatus last_status = {0};
     struct SceVideoOutFlipStatus current_status = {0};
@@ -72,11 +73,6 @@ static float calculate_global_system_fps(void) {
     if (time_diff == 0) return 0.0f;
     return ((float)frame_diff / (float)time_diff) * 1000000.0f;
 }
-
-extern int32_t sceVideoOutGetFlipStatus(int32_t handle, struct SceVideoOutFlipStatus *status);
-
-
-#include <dlfcn.h> // 必须确保 main.c 顶部有此标准的动态链接库头文件
 
 // 内建 PHU 点阵字库，用于在透明系统图层上静音画字 ［()］
 static const uint8_t font_bitmap[256][8] = {
@@ -138,54 +134,64 @@ static void* smp_metrics_injector_daemon(void* arg) {
     int apu_temp = 0, cpu_temp = 0;
     uint16_t fan_duty = 0;
     uint64_t chassis = 0;
-    uint32_t* notification_vram_address = NULL;
-    int32_t s_width = 1920, s_height = 1080;
 
-    // 🔒 核心开机锁：大睡 15 秒，确保原厂风扇设置和镜像加载 100% 成功首发常驻 ［()］
+    // 🔒 核心安全开机保护锁：大睡 15 秒，确保原厂风扇阈值和镜像挂载 100% 优先成功常驻
     sceKernelUsleep(15000000u); 
 
+    // 初始化标准 UDP 广播套接字
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in broadcast_addr;
+    memset(&broadcast_addr, 0, sizeof(broadcast_addr));
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(9988); // 广播发送到局域网的 9988 端口
+    broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255"); // 全局广播地址
+    
+    // 开启套接字的全局广播特权
+    int broadcast_enable = 1;
+    if (udp_fd >= 0) {
+        setsockopt(udp_fd, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable));
+    }
+
     while (!g_stop_requested) {
+        // 后台静默检索是否有活跃游戏 eboot.bin 运行
         int game_pid = (int)find_pid_by_name("eboot.bin", false);
 
         if (game_pid > 0) {
-            // 💡【5秒延迟核心】：发现游戏启动了，静默原地休眠 5 秒钟！ ［()］
+            // 💡【核心延时】：发现游戏拉起后，静默休眠 5 秒，等待原版时序平稳通过
             if (game_pid != last_tracked_pid) {
                 sceKernelUsleep(5000000u);
                 last_tracked_pid = game_pid;
-                
-                // 5秒后，游戏加载完全稳定，PHU 提权强制唤醒系统的隐藏全透明通知画布 ［()］
-                sceNotificationSetLayerState(1, 1); // 1 = 强制激活图层显示，1 = 强制完全静音音频通道
-                // 动态捞出当前系统通知画布在显存里的真实的物理重定向首地址
-                sceNotificationGetSurfaceAddress(&notification_vram_address, &s_width, &s_height);
             }
 
-            // 1秒1次 极其敏锐地抓取参数
+            // 1秒1次 纯 C 干净抓取全系统硬件状态大盘
             float live_fps = calculate_global_system_fps();
             sceKernelGetSocSensorTemperature(0, &apu_temp);
             sceKernelGetCpuTemperature(&cpu_temp);
             if (sceKernelGetCurrentFanDuty(&fan_duty, &chassis) != 0) { fan_duty = 0; }
 
-            char overlay_buffer[128]; ［() Bled]
-            snprintf(overlay_buffer, sizeof(overlay_buffer), 
-                     "FPS: %.1f | APU: %d C | GPU: %d C | FAN: %u%%", 
-                     live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty); ［()］
+            // 将参数组装成极简的网络纯净数据包，绝对不含任何弹窗气泡和文本内容
+            char network_packet[128];
+            snprintf(network_packet, sizeof(network_packet),
+                     "FPS:%.1f|APU:%d|GPU:%d|FAN:%u",
+                     live_fps, cpu_temp, apu_temp, (unsigned int)fan_duty);
 
-            // 🚀 利用 PHU 点阵直写，直接抹在电视屏幕最上方！0气泡弹窗，0叮咚声音打扰 ［()精简版]
-            if (notification_vram_address) {
-                draw_overlay_text_to_surface(notification_vram_address, s_width, overlay_buffer);
+            // 向局域网静默发射，一秒跳变一次
+            if (udp_fd >= 0) {
+                sendto(udp_fd, network_packet, strlen(network_packet), 0, 
+                       (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
             }
         } 
-        else if (game_pid <= 0 && last_tracked_pid > 0) {
-            // 💡【退出自动蒸发】：游戏关闭，立刻将透明层彻底关闭释放，大盘瞬间人间蒸发 ［()］
-            sceNotificationSetLayerState(0, 0); // 0 = 彻底隐藏，恢复系统原状
-            notification_vram_address = NULL;
+        else if (game_pid <= 0) {
             last_tracked_pid = 0;
         }
 
-        sceKernelUsleep(1000000u); // 严格维持 1 秒跳变刷新一次，0系统损耗 ［()］
+        // 精准 1 秒采集广播一次，0系统损耗
+        sceKernelUsleep(1000000u);
     }
+
+    if (udp_fd >= 0) close(udp_fd);
     return NULL;
-}       
+}   
 
 typedef struct {
   pthread_mutex_t reason_mutex;
@@ -722,8 +728,8 @@ int main(void) {
     pthread_create(&monitor_th, &monitor_attr, smp_metrics_injector_daemon, NULL);
     pthread_attr_destroy(&monitor_attr);
 
-     // ========================================================================
-    // 【终极安全挂载点】：平行拉起 PHU 机制常驻监控大盘线程
+    // ========================================================================
+    // 【平行孵化点】：在主程序准备进入原本的阻塞扫描主循环前，平行的拉起雷达
     // ========================================================================
     pthread_t monitor_th;
     pthread_attr_t monitor_attr;
