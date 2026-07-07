@@ -81,14 +81,12 @@ bool g_fan_config_invalid = false;
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
       
-    int fan_fd = open(ICC_FAN_DEVICE_NODE, O_RDWR);
+    int fan_fd = open(ICC_FAN_DEVICE_NODE, O_RDWR);   //读写方式访问设备
     if (fan_fd > 0) {
         // 核心加固：分配 28 字节完整缓冲区，彻底终结栈溢出 Bug
-        uint8_t buf[ICC_FAN_CMD_LEN] = {0}; 
-        
+        uint8_t buf[ICC_FAN_CMD_LEN] = {0};         
         // 目标温度严格写入到 Offset 5
-        buf[ICC_FAN_THRESHOLD_OFFSET] = target_temp;
-        
+        buf[ICC_FAN_THRESHOLD_OFFSET] = target_temp;        
         ioctl(fan_fd, ICC_FAN_IOCTL_SET_THRESHOLD, buf);
         close(fan_fd);
     }  
