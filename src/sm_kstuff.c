@@ -47,7 +47,6 @@ static kstuff_state_t g_kstuff;
 static _Atomic uint32_t g_pending_app_focus_id;
 static _Atomic bool g_pending_app_focus_valid;
 static _Atomic bool g_pending_config_reload;
-
 static uint32_t get_effective_pause_delay_seconds(const kstuff_game_entry_t *entry);
 
 static bool refresh_kstuff_support_state(void);
@@ -828,7 +827,7 @@ void sm_kstuff_game_poll(void) {
   }
 
   restore_kstuff_if_needed("pending auto-resume");
-  maybe_apply_kstuff_pause_for_slot(&g_kstuff.game);  
+  maybe_apply_kstuff_pause_for_slot(&g_kstuff.game);
 }
 
 void sm_kstuff_game_shutdown(void) {
