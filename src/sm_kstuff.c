@@ -47,6 +47,9 @@ static kstuff_state_t g_kstuff;
 static _Atomic uint32_t g_pending_app_focus_id;
 static _Atomic bool g_pending_app_focus_valid;
 static _Atomic bool g_pending_config_reload;
+
+extern void sm_hud_process_game_heartbeat(void);  //手柄按键捕获和处理
+
 static uint32_t get_effective_pause_delay_seconds(const kstuff_game_entry_t *entry);
 
 static bool refresh_kstuff_support_state(void);
@@ -828,6 +831,13 @@ void sm_kstuff_game_poll(void) {
 
   restore_kstuff_if_needed("pending auto-resume");
   maybe_apply_kstuff_pause_for_slot(&g_kstuff.game);
+
+    // kstuff 保持原有的单纯职责：只负责判定游戏是否激活
+    if (g_kstuff.game.active) {
+        // 游戏运行状态，只负责单线触发独立的 HUD 处理器，没有多线程对冲，绝不死锁
+        sm_hud_process_game_heartbeat();
+    }
+    // ===================================
 }
 
 void sm_kstuff_game_shutdown(void) {
