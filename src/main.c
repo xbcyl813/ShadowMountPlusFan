@@ -63,81 +63,21 @@ extern unsigned int config_ini_example_len;
 
 void force_write_fan_register_from_config(void);
 
-//  全局温度状态变量，用来存放最终生效的真实硬件温度
-uint8_t g_final_active_temp = 75;
-//全局配置合规性变量。默认置为 false（完全合规）
-// 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
-bool g_fan_config_invalid = false;
-
-// ====== 【修改点 1/2：完美对齐官方数据结构的 Union 数组版执行端】 ======
+// 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
-    int fan_fd = open("/dev/icc_fan", 0, 0); // 设备路径与命令字绝对真实，全固件通用
+    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
-        // 显式声明 28 字节单字节原生真数组，撑满 28 字节物理空间
-        uint8_t raw_packet[28];
-        
-        // 显式执行 for 循环安全清零，消灭任何编译器脏数据和越界溢出风险
-        for (int i = 0; i < 28; i++) {
-            raw_packet[i] = 0;
-        }
-
-        // 调用原厂完全存在的底层内核函数获取当前主机的固件大版本号
-        uint32_t raw_fw = kernel_get_fw_version();
-        uint32_t major_version = (raw_fw >> 24) & 0xFFu;
-
-        if (major_version >= 0x10u) {
-            // 【10.01 / 10.60 / 11.xx 高版本固件阵营】：
-            // 完全遵循目标期望温度控制律！用户指定的期望目标温度越低 ➔ 风扇基础占空比算出来越大（转速越快）！
-            // 用户的默认目标 75°C 现场代入计算：50 - ((75 - 60) * 4 / 5) = 50 - 12 = 38u！
-            // 38u 完美处于 10.60 新驱动听话、绝不暴走溢出的 30% ~ 50% 黄金常驻占空比安全甜点区！
-            uint32_t high_fw_duty = 50u - (((uint32_t)target_temp - 60u) * 4u / 5u);
-            
-            // 安全限幅防错夹钳，确保最终计算出的硬件占空比绝对在 [30u, 50u] 之间，100% 封死由于低频引起的暴走
-            if (high_fw_duty < 30u) high_fw_duty = 30u;
-            if (high_fw_duty > 50u) high_fw_duty = 50u;
-
-            // 【终极降维绝杀】：利用 C 语言最纯正的指针强转指针操作！
-            // 强行把整个 raw_packet 数组的头部首地址（前 4 字节），临时伪装成一个标准的 32 位无符号整数指针
-            // 通过汇编级 movl 指令，将 32 位整数形式的占空比控制字整块一发入魂、毫无二进制高位符号污染地直接打入前排 4 字节中！
-            // 彻底消灭了局部变量退栈和位移错位导致的寄存器乱码，10.60 南桥进门完美读取 38%，看门狗瞬间熄火！
-            *(uint32_t *)&raw_packet[0] = high_fw_duty;
-        } else {
-            // 【3.00 ~ 9.60 低版本固件阵营（包含 4.03, 7.61, 9.00）】：
-            // 【低版本正确下标赋值】：彻底对齐您指出的、7.61 已经测试跑通的最高物理铁律！
-            // 没有任何指针偏移和类型混乱，将用户的原始摄氏度温度（如 75）分毫不差、精准死死刻在【第 6 个格子（索引 5）】上！
-            raw_packet[5] = target_temp; 
-        }
-
-        // 下发经过二进制级别绝对锁死、高低版本各自完美解耦对齐的 28 字节标准数据包
-        ioctl(fan_fd, 0xC01C8F07, raw_packet);
+        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
+        ioctl(fan_fd, 0xC01C8F07, data);
         close(fan_fd);
     }
 }
-// ==============================================================================
 
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
-    uint32_t target_temp = runtime_config()->target_temp;
-
-    // 默认认为用户的配置是合规的
-    g_fan_config_invalid = false;
-  
-    // 判断参数值是否为空，如果是空值，取默认值 75 度
-    if (target_temp == 0u) {
-         target_temp = 75u;
-         g_fan_config_invalid = true;
-    }
-    // 基础的边界安全限幅，将温度阈值控制在 60 到 85 度之间
-    else if (target_temp < 60u || target_temp > 85u) {
-        target_temp = 75u;
-        g_fan_config_invalid = true; 
-    }  
-
-    // 将最终温度阈值赋予全局变量
-    g_final_active_temp = (uint8_t)target_temp;
-  
-    // 调用上面重构好的标准格子执行端
-    force_write_fan_register(g_final_active_temp);
+    uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
+                                 (uint8_t)runtime_config()->target_temp : 75;
+    force_write_fan_register(current_guard_temp);
 }
 
 static void on_signal(int sig) {
@@ -548,26 +488,12 @@ int main(void) {
     log_debug("[RESTART] Previous instance stopped, continuing startup");
   load_runtime_config();
 
-    // ====== 【修改点 2/2：冷启动初始化与全局唯一计算源中心注入】 ======
-    sceKernelUsleep(2000000u); // 转换前等待 2 秒
-
-    // 触发上方我们全新对齐的全局包装函数，在开机安全时刻立即让初次变速生效！
+    // ====== 【风扇冷启动初次应用配置】 ======
+    sceKernelUsleep(2000000u);
     force_write_fan_register_from_config();
-
-    // 独立把弹窗和延迟留在 main 内部，根据被染色后的全局布尔标志状态，下发最精准的人机交互反馈
-    if (g_fan_config_invalid) {
-        // 如果用户的配置超出范围或写漏，连续飘出两行警告，UX 体验极佳
-        notify_system("Warning: Fan config out of safe range (60-85°C)!");
-        sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
-        notify_system("Default threshold adopted: 75°C!");
-    } else {
-        // 如果用户的配置完全合法，则直接读取全局变量里的数字，清爽平滑地飘出标准成功气泡
-        notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
-    }
-
-    sceKernelUsleep(2000000u); // 转换后等待 2 秒
+    notify_system("Fan Threshold Set to %d°C!", (int)runtime_config()->target_temp);
+    sceKernelUsleep(2000000u);
     // ==============================================================================
-
   
   sm_notifications_init();
   stop_conflicting_backpork();
