@@ -2,8 +2,8 @@
 #define SHADOWMOUNT_HUD_H
 
 /**
- * 处理游戏运行期间的手柄监控 HUD 心跳
+ * 专职手柄 HUD 定时器线程主循环
  */
-void sm_hud_process_game_heartbeat(void);
+void* sm_hud_thread_loop(void* arg);
 
 #endif // SHADOWMOUNT_HUD_H
