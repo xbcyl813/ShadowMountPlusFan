@@ -63,6 +63,12 @@ extern unsigned int config_ini_example_len;
 
 void force_write_fan_register_from_config(void);
 
+//  全局温度状态变量，用来存放最终生效的真实硬件温度
+uint8_t g_final_active_temp = 75;
+//全局配置合规性变量。默认置为 false（完全合规）
+// 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
+bool g_fan_config_invalid = false;
+
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
     int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
@@ -75,9 +81,25 @@ static void force_write_fan_register(uint8_t target_temp) {
 
 // 供外部独立事件源跨文件调用的标准包装函数
 void force_write_fan_register_from_config(void) {
-    uint8_t current_guard_temp = (runtime_config()->target_temp >= 60u && runtime_config()->target_temp <= 79u) ? 
-                                 (uint8_t)runtime_config()->target_temp : 75;
-    force_write_fan_register(current_guard_temp);
+     uint32_t target_temp = runtime_config()->target_temp;
+
+   // 默认认为用户的配置是合规的
+    g_fan_config_invalid = false;
+  
+   // 判断参数值是否为空，如果是空值，取默认值 75 度
+     if (target_temp == 0u) {
+         target_temp = 75u;
+         g_fan_config_invalid = true;
+      }
+   // 基础的边界安全限幅，将温度阈值控制在60到85度之间。
+    else if (target_temp < 60u || target_temp > 85u) {
+        target_temp = 75u;
+        g_fan_config_invalid = true; 
+       }  
+
+  // 将最终温度阈值赋予全局变量
+    g_final_active_temp = (uint8_t)target_temp;  
+   force_write_fan_register(g_final_active_temp);
 }
 
 static void on_signal(int sig) {
@@ -491,7 +513,15 @@ int main(void) {
     // ====== 【风扇冷启动初次应用配置】 ======
     sceKernelUsleep(2000000u);
     force_write_fan_register_from_config();
-    notify_system("Fan Threshold Set to %d°C!", (int)runtime_config()->target_temp);
+     if (g_fan_config_invalid) {
+        // 如果用户的配置超出范围或写漏
+        notify_system("Warning: Fan config out of safe range (60-85°C)!");
+        sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
+        notify_system("Default threshold adopted: %d°C!", (int)g_final_active_temp);
+    } else {
+        // 如果用户的配置完全合法，则清爽平滑地飘出标准成功气泡
+        notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
+    }
     sceKernelUsleep(2000000u);
     // ==============================================================================
   
