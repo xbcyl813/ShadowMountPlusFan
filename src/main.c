@@ -49,24 +49,48 @@ static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ====================================================================
-// === 【新增代码 1】: PS5 底层原生手柄符号声明与长按快捷键配置 ===
+// === 【修正后代码 1】: PS5 底层原生手柄符号声明与全局结构体定义 ===
 // ====================================================================
 extern int scePadInit(void);
 extern int scePadOpen(int userId, int type, int index, void* pParam);
 extern int scePadReadState(int handle, void* pData);
 
-// 索尼手柄底层的 Share 键 (Create键) 的物理位掩码
-#define SCE_PAD_BUTTON_SHARE  0x00000020u  
-// 连续检测到按下的次数（10次 * 100ms = 1秒）
-#define LONG_PRESS_THRESHOLD  10           
-// 手柄检测频率：100毫秒 (0.1秒)
-#define PAD_POLL_INTERVAL_US  100000u      
+#define SCE_PAD_BUTTON_SHARE  0x00000020u  // Share键(Create键)的物理掩码
+#define LONG_PRESS_THRESHOLD  10           // 连续检测到按下的次数（10次 * 100ms = 1秒）
+#define PAD_POLL_INTERVAL_US  100000u      // 手柄检测频率：100毫秒 (0.1秒)
 
-// 显式引入你本地已经实例化并维护的影子挂载全局状态变量（来自 sm_kstuff.h）
-#include "sm_kstuff.h"
+// 🌟 核心修正：显式将您 sm_kstuff 里的所有底层依赖结构体类型告诉 main.c 编译器
+typedef struct {
+    bool active;
+    bool image_backed;
+    bool autopause_delay_valid;
+    bool pause_applied;
+    bool focus_override_active;
+    pid_t pid;
+    uint32_t app_id;
+    uint32_t autopause_delay_seconds;
+    uint64_t launch_time_us;
+    uint64_t pause_deadline_us;
+    char title_id[16]; // 严格对齐 MAX_TITLE_ID (PS5的标准TitleID为16字节)
+} kstuff_game_entry_t;
+
+typedef struct {
+    intptr_t sysentvec_ps5;
+    intptr_t sysentvec_ps4;
+    bool probe_available;
+    bool supported;
+    bool restore_on_empty;
+    bool sleep_pause_restore;
+    bool current_app_focus_valid;
+    uint32_t current_app_focus_id;
+    uint64_t restore_retry_us;
+    kstuff_game_entry_t game;
+} kstuff_state_t;
+
+// 此时编译器已经知道了 kstuff_state_t 的大小和长相，extern 将不再报错
 extern kstuff_state_t g_kstuff; 
 
-// 手柄长按线程专用的独立状态控制变量
+// 手柄长按线程专用的状态控制变量
 static uint64_t g_share_press_start_ms = 0;
 static bool g_share_long_pressed_triggered = false;
 
