@@ -48,6 +48,105 @@ static _Atomic(uintptr_t) g_shutdown_stop_reason_bits = 0;
 static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// ====================================================================
+// === 【新增代码 1】: PS5 底层原生手柄符号声明与长按快捷键配置 ===
+// ====================================================================
+extern int scePadInit(void);
+extern int scePadOpen(int userId, int type, int index, void* pParam);
+extern int scePadReadState(int handle, void* pData);
+
+// 索尼手柄底层的 Share 键 (Create键) 的物理位掩码
+#define SCE_PAD_BUTTON_SHARE  0x00000020u  
+// 连续检测到按下的次数（10次 * 100ms = 1秒）
+#define LONG_PRESS_THRESHOLD  10           
+// 手柄检测频率：100毫秒 (0.1秒)
+#define PAD_POLL_INTERVAL_US  100000u      
+
+// 显式引入你本地已经实例化并维护的影子挂载全局状态变量（来自 sm_kstuff.h）
+#include "sm_kstuff.h"
+extern kstuff_state_t g_kstuff; 
+
+// 手柄长按线程专用的独立状态控制变量
+static uint64_t g_share_press_start_ms = 0;
+static bool g_share_long_pressed_triggered = false;
+
+// ====================================================================
+// === 【新增代码 2】: 带有影子挂载游戏过滤的原生手柄常驻监听线程 ===
+// ====================================================================
+static void* pad_shortcut_monitor_thread(void* arg) {
+    (void)arg;
+    int pad_handle = -1;
+    uint32_t press_counter = 0;
+    bool is_triggered = false;
+
+    // 1. 初始化底层物理手柄驱动
+    if (scePadInit() < 0) {
+        log_debug("[SHORTCUT] Failed to initialize native pad system.");
+        return NULL;
+    }
+
+    // 2. 打开全局标准手柄通道 (UserId 填 -1 代表全局输入拦截)
+    pad_handle = scePadOpen(-1, 0, 0, NULL); 
+    if (pad_handle < 0) {
+        log_debug("[SHORTCUT] Failed to open native pad handle.");
+        return NULL;
+    }
+
+    // 3. 进入高频常驻手柄检测循环
+    while (!g_stop_requested) { // 严格遵循你 main.c 中的全局停止标志
+        
+        // 🌟 核心门槛拦截：如果影子挂载显示当前不在游戏跟踪状态，彻底睡眠，保护按键不与系统截图冲突
+        if (!g_kstuff.game.active) {
+            press_counter = 0;    // 只要不在游戏里，随时重置计数器
+            is_triggered = false; // 解除触发锁
+            
+            sceKernelUsleep(PAD_POLL_INTERVAL_US); 
+            continue;
+        }
+
+        // ----------------------------------------------------
+        // 以下逻辑仅在【处于您本地影子挂载追踪的游戏状态下】才会激活：
+        // ----------------------------------------------------
+        uint32_t pad_buttons = 0;
+        unsigned char pad_buffer[512]; // 承接索尼原生手柄数据的足够缓冲区
+        memset(pad_buffer, 0, sizeof(pad_buffer));
+
+        // 从底层物理驱动读取当前手柄的原始高低电平数据
+        if (scePadReadState(pad_handle, pad_buffer) == 0) {
+            // 根据索尼标准结构体对齐，前 4 字节即为 buttons 的 32 位掩码值
+            memcpy(&pad_buttons, pad_buffer, sizeof(uint32_t));
+
+            // 检查 Share 键当前是否正处于按下状态
+            if (pad_buttons & SCE_PAD_BUTTON_SHARE) {
+                if (!is_triggered) {
+                    press_counter++;
+                    
+                    // 当连续按住次数达到 10 次（10 * 100ms = 1秒）
+                    if (press_counter >= LONG_PRESS_THRESHOLD) {
+                        
+                        // 🌟 核心需求：在游戏状态下触发你项目原生自带的弹气泡函数，并附带正在运行的游戏TitleID
+                        notify_system("Shortcut Activated!\nTarget Game: %s", g_kstuff.game.title_id);
+                        
+                        // 💡 提示：后续如果想加入金手指或风扇操作，直接贴在这一行下方即可：
+                        // execute_my_native_cheats(g_kstuff.game.pid);
+
+                        is_triggered = true; // 锁定触发，防止手指没松开时气泡无限重弹刷屏
+                    }
+                }
+            } else {
+                // 手指只要松开，立刻重置本轮的计数器与锁定
+                press_counter = 0;
+                is_triggered = false;
+            }
+        }
+
+        // 每次检测完休眠 100 毫秒，对系统性能零消耗
+        sceKernelUsleep(PAD_POLL_INTERVAL_US);
+    }
+    return NULL;
+}
+
+
 typedef struct {
   pthread_mutex_t reason_mutex;
   char reason[128];
@@ -582,6 +681,19 @@ int main(void) {
     log_debug("[STARTUP] scanner startup sync aborted");
     goto shutdown;
   }
+  
+   // ====================================================================
+    // === 🌟【冷启动核心】：在此处异步启动我们写好的异步手柄常驻监听线程 ===
+    // ====================================================================
+    pthread_t monitor_tid;
+    if (pthread_create(&monitor_tid, NULL, pad_shortcut_monitor_thread, NULL) == 0) {
+        pthread_detach(monitor_tid); // 将线程剥离到后台独立常驻，不阻塞主线程
+        log_debug("[STARTUP] Native pad shortcut service started for active games.");
+    } else {
+        log_debug("[ERROR] Failed to start shortcut service thread.");
+    }
+    // ====================================================================
+  
   log_debug("[STARTUP] scanner startup sync done");
   sm_scanner_run_loop();
 
