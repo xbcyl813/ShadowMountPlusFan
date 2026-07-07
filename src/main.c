@@ -71,12 +71,15 @@ bool g_fan_config_invalid = false;
 
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
-    int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
+ // 强制抢占挂载状态全局互斥锁，将硬件 ioctl 隔离在绝对的多线程安全区
+   pthread_mutex_lock(&g_runtime_mount_state_mutex);   
+  int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
     if (fan_fd > 0) {
         char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
         ioctl(fan_fd, 0xC01C8F07, data);
         close(fan_fd);
     }
+  pthread_mutex_unlock(&g_runtime_mount_state_mutex); // 释放锁
 }
 
 // 供外部独立事件源跨文件调用的标准包装函数
