@@ -81,7 +81,7 @@ bool g_fan_config_invalid = false;
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
       
-    int fan_fd = open(ICC_FAN_DEVICE_NODE, O_RDWR)
+    int fan_fd = open(ICC_FAN_DEVICE_NODE, O_RDWR);
     if (fan_fd > 0) {
         // 核心加固：分配 28 字节完整缓冲区，彻底终结栈溢出 Bug
         uint8_t buf[ICC_FAN_CMD_LEN] = {0}; 
