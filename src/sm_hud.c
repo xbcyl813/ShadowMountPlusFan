@@ -9,6 +9,10 @@
 #include <pthread.h>    
 #include <pthread_np.h> 
 
+// ====== 【一击必杀修复点：显式引入 SDK 原生动态模块与内核调用头文件】 ======
+#include <sdk/kernel.h> 
+// =====================================================================
+
 #define SCE_PAD_BUTTON_SHARE    0x00000020u  
 #define HUD_TRIGGER_TICKS       16           
 #define HUD_COOLDOWN_US         5000000ull   
@@ -47,7 +51,7 @@ void* sm_hud_thread_loop(void* arg) {
     fn_sceKernelGetCpuTemperature pfn_sceKernelGetCpuTemperature = NULL;
     fn_sceKernelGetSocSensorTemperature pfn_sceKernelGetSocSensorTemperature = NULL;
 
-    // 动态打捞手柄特权事件函数（利用通用特权句柄 0x20001UL 获取内置 libkernel）
+    // 动态打捞手频特权事件函数（利用通用特权句柄 0x20001UL 获取内置 libkernel）
     sceKernelDlsym(0x20001UL, "sceKernelGetCurrentFanDuty", (void**)&pfn_sceKernelGetCurrentFanDuty);
     sceKernelDlsym(0x20001UL, "sceKernelGetCpuTemperature", (void**)&pfn_sceKernelGetCpuTemperature);
     sceKernelDlsym(0x20001UL, "sceKernelGetSocSensorTemperature", (void**)&pfn_sceKernelGetSocSensorTemperature);
