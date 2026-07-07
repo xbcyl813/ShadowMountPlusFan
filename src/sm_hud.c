@@ -1,13 +1,13 @@
 #include "sm_platform.h"
 #include "sm_log.h"
 #include "sm_time.h"
-#include "sm_runtime.h" // 补齐：引入该头文件，解锁 should_stop_requested 与 runtime_sleep_mode_active
+#include "sm_runtime.h" 
 #include "sm_hud.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>    // 补齐：解锁 pthread_self
-#include <pthread_np.h> // 补齐：解锁 FreeBSD 特有的 pthread_setname_np
+#include <pthread.h>    
+#include <pthread_np.h> // 成功引入该头文件，解锁 pthread_set_name_np
 
 // 金手指/etaHEN 特权级 Share 键长按（二进制第 5 位掩码）
 #define SCE_PAD_BUTTON_SHARE    0x00000020u  
@@ -44,8 +44,9 @@ static int      g_cached_pad_handle = -1;
 void* sm_hud_thread_loop(void* arg) {
     (void)arg;
     
-    // 强制声明前置，确保所有 FreeBSD 11 严格固件下符号链接正确
-    pthread_setname_np(pthread_self(), "smplus-hud");
+    // ====== 【一击必杀修改点：对齐 PS5/FreeBSD 原厂特有的下划线符号拼写，彻底终结编译错误！】 ======
+    pthread_set_name_np(pthread_self(), "smplus-hud");
+    // ===================================================================================
     
     ScePadData pad;
     
@@ -61,7 +62,6 @@ void* sm_hud_thread_loop(void* arg) {
             current_handle = g_cached_pad_handle;
         } else {
             int test_handles[] = {-1, 0, 1, 0x100, 0x101};
-            // 修正：将分母准确修改为 sizeof(test_handles[0])，彻底斩断 Clang 的编译警告！
             for (size_t i = 0; i < (sizeof(test_handles) / sizeof(test_handles[0])); i++) {
                 if (scePadReadState(test_handles[i], &pad, 1) > 0) {
                     current_handle = test_handles[i];
