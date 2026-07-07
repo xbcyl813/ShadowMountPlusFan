@@ -1,10 +1,13 @@
 #include "sm_platform.h"
 #include "sm_log.h"
 #include "sm_time.h"
+#include "sm_runtime.h" // 补齐：引入该头文件，解锁 should_stop_requested 与 runtime_sleep_mode_active
 #include "sm_hud.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>    // 补齐：解锁 pthread_self
+#include <pthread_np.h> // 补齐：解锁 FreeBSD 特有的 pthread_setname_np
 
 // 金手指/etaHEN 特权级 Share 键长按（二进制第 5 位掩码）
 #define SCE_PAD_BUTTON_SHARE    0x00000020u  
@@ -41,27 +44,25 @@ static int      g_cached_pad_handle = -1;
 void* sm_hud_thread_loop(void* arg) {
     (void)arg;
     
-    // 给该内核线程命名，防止被系统看门狗误杀
+    // 强制声明前置，确保所有 FreeBSD 11 严格固件下符号链接正确
     pthread_setname_np(pthread_self(), "smplus-hud");
     
     ScePadData pad;
     
-    // 只要程序处于运行稳态，该轻量线程就一直以 50ms 的频率跳动
     while (!should_stop_requested()) {
         
-        // 如果主机处于休眠状态，礼貌避让不骚扰硬件驱动
         if (runtime_sleep_mode_active()) {
             sceKernelUsleep(500000u); // 休眠时降频为 500ms 探测一次
             continue;
         }
 
         int current_handle = -1;
-        // 金手指级全局特权句柄混杂盲扫（优先盲扫 -1，强行扒出被 OS 隔离的原始 Share 键）
         if (g_cached_pad_handle != -1 && scePadReadState(g_cached_pad_handle, &pad, 1) > 0) {
             current_handle = g_cached_pad_handle;
         } else {
             int test_handles[] = {-1, 0, 1, 0x100, 0x101};
-            for (size_t i = 0; i < sizeof(test_handles)/sizeof(test_handles); i++) {
+            // 修正：将分母准确修改为 sizeof(test_handles[0])，彻底斩断 Clang 的编译警告！
+            for (size_t i = 0; i < (sizeof(test_handles) / sizeof(test_handles[0])); i++) {
                 if (scePadReadState(test_handles[i], &pad, 1) > 0) {
                     current_handle = test_handles[i];
                     g_cached_pad_handle = current_handle; 
@@ -70,7 +71,6 @@ void* sm_hud_thread_loop(void* arg) {
             }
         }
 
-        // 成功拿到活跃手柄数据流，开始执行长按判断
         if (current_handle != -1) {
             if (pad.buttons & SCE_PAD_BUTTON_SHARE) {
                 g_hud_share_press_ticks++;
@@ -80,7 +80,7 @@ void* sm_hud_thread_loop(void* arg) {
                     g_hud_last_popup_us = now_us;
                     g_hud_share_press_ticks = 0;
 
-                    // 【事件提前消费】：长按判定达成瞬间，原地抹零 Share 位，有效压制和拦截系统截图的弹出
+                    // 长按判定达成瞬间，原地抹零 Share 位，有效压制和拦截系统截图的弹出
                     pad.buttons &= ~SCE_PAD_BUTTON_SHARE;
 
                     uint16_t fan_raw = 0; uint64_t chassis = 0;
@@ -110,7 +110,7 @@ void* sm_hud_thread_loop(void* arg) {
             }
         }
 
-        // 精准的 50 毫秒（50000微秒）心跳步进基准，完全独立，绝不骚扰文件系统事件
+        // 精准的 50 毫秒心跳步进基准
         sceKernelUsleep(50000u); 
     }
     
