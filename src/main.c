@@ -49,26 +49,19 @@ static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ====================================================================
-// === 【更新后代码 1】: 改用游戏物理组合键（L3 + R3）===
+// === 【修正后代码 1】: 包含完整结构体定义的 L3 + R3 组合键声明 ===
 // ====================================================================
 extern int scePadInit(void);
 extern int scePadOpen(int userId, int type, int index, void* pParam);
 extern int scePadReadState(int handle, void* pData);
 
-// 🌟 核心更新：将掩码修改为左右摇杆下压物理键
 #define SCE_PAD_BUTTON_L3      0x00000001u  // L3 (左摇杆下压) 物理掩码
 #define SCE_PAD_BUTTON_R3      0x00000002u  // R3 (右摇杆下压) 物理掩码
 
 #define LONG_PRESS_THRESHOLD  10            // 连续检测到按下的次数（10次 * 100ms = 1秒）
 #define PAD_POLL_INTERVAL_US  100000u       // 手柄检测频率：100毫秒 (0.1秒)
 
-#include "sm_kstuff.h"
-extern kstuff_state_t g_kstuff;             // 影子挂载状态机
-
-static uint64_t g_share_press_start_ms = 0;
-static bool g_share_long_pressed_triggered = false;
-
-// 🌟 核心修正：显式将您 sm_kstuff 里的所有底层依赖结构体类型告诉 main.c 编译器
+// 🌟 核心修正：显式提供你在 sm_kstuff.c 里的结构体长相给 main.c 编译器
 typedef struct {
     bool active;
     bool image_backed;
@@ -80,7 +73,7 @@ typedef struct {
     uint32_t autopause_delay_seconds;
     uint64_t launch_time_us;
     uint64_t pause_deadline_us;
-    char title_id[16]; // 严格对齐 MAX_TITLE_ID (PS5的标准TitleID为16字节)
+    char title_id[16]; // 严格对齐你项目原本的 16 字节大小
 } kstuff_game_entry_t;
 
 typedef struct {
@@ -96,6 +89,11 @@ typedef struct {
     kstuff_game_entry_t game;
 } kstuff_state_t;
 
+// 此时编译器已经知道了 kstuff_state_t 的完整尺寸，extern 将完美通过
+extern kstuff_state_t g_kstuff;             // 影子挂载状态机
+
+static uint64_t g_share_press_start_ms = 0;
+static bool g_share_long_pressed_triggered = false;
 
 // ====================================================================
 // === 【新增代码 2】: 带有影子挂载游戏过滤的原生手柄常驻监听线程 ===
