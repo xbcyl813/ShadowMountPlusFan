@@ -3,8 +3,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/sysctl.h>
-#include "sm_hud.h"
-#include <pthread.h>
 
 #include "sm_runtime.h"
 #include "sm_types.h"
@@ -585,16 +583,6 @@ int main(void) {
     goto shutdown;
   }
   log_debug("[STARTUP] scanner startup sync done");
-
-    // ====== 【一击必杀修改点：在进入扫描阻塞循环前，无损派生常驻后台的定时手柄监控线程】 ======
-    pthread_t hud_thread_id;
-    if (pthread_create(&hud_thread_id, NULL, sm_hud_thread_loop, NULL) == 0) {
-        pthread_detach(hud_thread_id); // 剥离线程，让其无阻塞驻留后台自生自灭，开销极低
-        log_debug("[HUD] Dedicated Controller Shortcuts Watcher thread started successfully.");
-    }
-    // ====================================================================================
-
-  
   sm_scanner_run_loop();
 
 shutdown:
