@@ -49,15 +49,24 @@ static atomic_uint_fast64_t g_next_stop_file_poll_us = 0;
 static pthread_mutex_t g_runtime_mount_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ====================================================================
-// === 【修正后代码 1】: PS5 底层原生手柄符号声明与全局结构体定义 ===
+// === 【更新后代码 1】: 改用游戏物理组合键（L3 + R3）===
 // ====================================================================
 extern int scePadInit(void);
 extern int scePadOpen(int userId, int type, int index, void* pParam);
 extern int scePadReadState(int handle, void* pData);
 
-#define SCE_PAD_BUTTON_SHARE  0x00000020u  // Share键(Create键)的物理掩码
-#define LONG_PRESS_THRESHOLD  10           // 连续检测到按下的次数（10次 * 100ms = 1秒）
-#define PAD_POLL_INTERVAL_US  100000u      // 手柄检测频率：100毫秒 (0.1秒)
+// 🌟 核心更新：将掩码修改为左右摇杆下压物理键
+#define SCE_PAD_BUTTON_L3      0x00000001u  // L3 (左摇杆下压) 物理掩码
+#define SCE_PAD_BUTTON_R3      0x00000002u  // R3 (右摇杆下压) 物理掩码
+
+#define LONG_PRESS_THRESHOLD  10            // 连续检测到按下的次数（10次 * 100ms = 1秒）
+#define PAD_POLL_INTERVAL_US  100000u       // 手柄检测频率：100毫秒 (0.1秒)
+
+#include "sm_kstuff.h"
+extern kstuff_state_t g_kstuff;             // 影子挂载状态机
+
+static uint64_t g_share_press_start_ms = 0;
+static bool g_share_long_pressed_triggered = false;
 
 // 🌟 核心修正：显式将您 sm_kstuff 里的所有底层依赖结构体类型告诉 main.c 编译器
 typedef struct {
@@ -87,12 +96,6 @@ typedef struct {
     kstuff_game_entry_t game;
 } kstuff_state_t;
 
-// 此时编译器已经知道了 kstuff_state_t 的大小和长相，extern 将不再报错
-extern kstuff_state_t g_kstuff; 
-
-// 手柄长按线程专用的状态控制变量
-static uint64_t g_share_press_start_ms = 0;
-static bool g_share_long_pressed_triggered = false;
 
 // ====================================================================
 // === 【新增代码 2】: 带有影子挂载游戏过滤的原生手柄常驻监听线程 ===
@@ -103,73 +106,64 @@ static void* pad_shortcut_monitor_thread(void* arg) {
     uint32_t press_counter = 0;
     bool is_triggered = false;
 
-    // 1. 初始化底层物理手柄驱动
     if (scePadInit() < 0) {
         log_debug("[SHORTCUT] Failed to initialize native pad system.");
         return NULL;
     }
 
-    // 2. 打开全局标准手柄通道 (UserId 填 -1 代表全局输入拦截)
-    pad_handle = scePadOpen(-1, 0, 0, NULL); 
+    // 传入 0 以最大程度保证在游戏独占屏幕状态下依然能够拿到物理手柄的按键字节流
+    pad_handle = scePadOpen(0, 0, 0, NULL); 
     if (pad_handle < 0) {
         log_debug("[SHORTCUT] Failed to open native pad handle.");
         return NULL;
     }
 
-    // 3. 进入高频常驻手柄检测循环
-    while (!g_stop_requested) { // 严格遵循你 main.c 中的全局停止标志
+    while (!g_stop_requested) {
         
-        // 🌟 核心门槛拦截：如果影子挂载显示当前不在游戏跟踪状态，彻底睡眠，保护按键不与系统截图冲突
+        // 🌟 门槛拦截：如果影子挂载显示当前没有运行游戏，快捷键完全不工作，防止在主界面误触
         if (!g_kstuff.game.active) {
-            press_counter = 0;    // 只要不在游戏里，随时重置计数器
-            is_triggered = false; // 解除触发锁
-            
+            press_counter = 0;    
+            is_triggered = false; 
             sceKernelUsleep(PAD_POLL_INTERVAL_US); 
             continue;
         }
 
-        // ----------------------------------------------------
-        // 以下逻辑仅在【处于您本地影子挂载追踪的游戏状态下】才会激活：
-        // ----------------------------------------------------
         uint32_t pad_buttons = 0;
-        unsigned char pad_buffer[512]; // 承接索尼原生手柄数据的足够缓冲区
+        unsigned char pad_buffer[128]; // 提供足够的缓冲区
         memset(pad_buffer, 0, sizeof(pad_buffer));
 
-        // 从底层物理驱动读取当前手柄的原始高低电平数据
         if (scePadReadState(pad_handle, pad_buffer) == 0) {
-            // 根据索尼标准结构体对齐，前 4 字节即为 buttons 的 32 位掩码值
             memcpy(&pad_buttons, pad_buffer, sizeof(uint32_t));
 
-            // 检查 Share 键当前是否正处于按下状态
-            if (pad_buttons & SCE_PAD_BUTTON_SHARE) {
+            // 🌟 核心更新：检查玩家当前是否【同时下压了左摇杆(L3)和右摇杆(R3)】
+            uint32_t combo_mask = SCE_PAD_BUTTON_L3 | SCE_PAD_BUTTON_R3;
+            if ((pad_buttons & combo_mask) == combo_mask) {
                 if (!is_triggered) {
                     press_counter++;
                     
-                    // 当连续按住次数达到 10 次（10 * 100ms = 1秒）
+                    // 当在游戏内持续同时按住 L3 + R3 达到 10 次（1秒）
                     if (press_counter >= LONG_PRESS_THRESHOLD) {
                         
-                        // 🌟 核心需求：在游戏状态下触发你项目原生自带的弹气泡函数，并附带正在运行的游戏TitleID
-                        notify_system("Shortcut Activated!\nTarget Game: %s", g_kstuff.game.title_id);
+                        // 🌟 成功触发：原地抛出独立的常驻气泡通知！
+                        notify_system("ShadowMount+ Shortcut Activated!\nActive Game: %s", g_kstuff.game.title_id);
                         
-                        // 💡 提示：后续如果想加入金手指或风扇操作，直接贴在这一行下方即可：
-                        // execute_my_native_cheats(g_kstuff.game.pid);
+                        // 💡 提示：后续如果想加入别的功能（如改风扇或注入金手指），写在此行下方即可
+                        // force_write_fan_register_from_config();
 
-                        is_triggered = true; // 锁定触发，防止手指没松开时气泡无限重弹刷屏
+                        is_triggered = true; // 锁定触发，手指不放开时不重复刷屏
                     }
                 }
             } else {
-                // 手指只要松开，立刻重置本轮的计数器与锁定
+                // 只要松开其中任意一个按键，立刻重置本轮的计数器与触发状态
                 press_counter = 0;
                 is_triggered = false;
             }
         }
 
-        // 每次检测完休眠 100 毫秒，对系统性能零消耗
         sceKernelUsleep(PAD_POLL_INTERVAL_US);
     }
     return NULL;
 }
-
 
 typedef struct {
   pthread_mutex_t reason_mutex;
