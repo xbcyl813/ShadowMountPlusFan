@@ -43,7 +43,7 @@ typedef struct {
   kstuff_game_entry_t game;
 } kstuff_state_t;
 
-kstuff_state_t g_kstuff;
+static kstuff_state_t g_kstuff;
 static _Atomic uint32_t g_pending_app_focus_id;
 static _Atomic bool g_pending_app_focus_valid;
 static _Atomic bool g_pending_config_reload;
