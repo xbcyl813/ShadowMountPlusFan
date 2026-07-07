@@ -10,7 +10,6 @@
 #include "sm_runtime.h"
 #include "sm_time.h"
 #include "sm_types.h"
-#include "sm_hud.h"
 
 #include <stdatomic.h>
 
@@ -829,12 +828,7 @@ void sm_kstuff_game_poll(void) {
   }
 
   restore_kstuff_if_needed("pending auto-resume");
-  maybe_apply_kstuff_pause_for_slot(&g_kstuff.game);
-
-   // 完美解耦的纯净切入：只要游戏活跃，单线通知 HUD 子系统处理手柄心跳
-    if (g_kstuff.game.active) {
-        sm_hud_process_game_heartbeat();
-    }
+  maybe_apply_kstuff_pause_for_slot(&g_kstuff.game);  
 }
 
 void sm_kstuff_game_shutdown(void) {
