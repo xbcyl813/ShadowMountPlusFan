@@ -75,9 +75,7 @@ bool g_fan_config_invalid = false;
 #define ICC_FAN_THRESHOLD_OFFSET 5
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
-    // 强制抢占挂载状态全局互斥锁，将硬件 ioctl 隔离在绝对的多线程安全区
-    pthread_mutex_lock(&g_runtime_mount_state_mutex);
-    
+      
     int fan_fd = open("/dev/icc_fan", O_RDWR); // 对齐原版采用标准可读写 O_RDWR 打开
     if (fan_fd > 0) {
         // 核心加固：分配 28 字节完整缓冲区，彻底终结栈溢出 Bug
@@ -88,8 +86,7 @@ static void force_write_fan_register(uint8_t target_temp) {
         
         ioctl(fan_fd, 0xC01C8F07UL, buf);
         close(fan_fd);
-    }
-    pthread_mutex_unlock(&g_runtime_mount_state_mutex); // 释放锁
+    }  
 }
 
 // 供外部独立事件源跨文件调用的标准包装函数
