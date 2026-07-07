@@ -69,17 +69,26 @@ uint8_t g_final_active_temp = 75;
 // 如果用户写漏了或者超出了 60~85 的范围，该变量会变为 true（非法）
 bool g_fan_config_invalid = false;
 
+#define ICC_FAN_CMD_LEN 28
+#define ICC_FAN_THRESHOLD_OFFSET 5
 // 独立的风扇底层快捷写入函数
 static void force_write_fan_register(uint8_t target_temp) {
- // 强制抢占挂载状态全局互斥锁，将硬件 ioctl 隔离在绝对的多线程安全区
-   pthread_mutex_lock(&g_runtime_mount_state_mutex);   
-  int fan_fd = open("/dev/icc_fan", 0, 0); // O_RDONLY
+    // 强制抢占挂载状态全局互斥锁，将硬件 ioctl 隔离在绝对的多线程安全区
+    pthread_mutex_lock(&g_runtime_mount_state_mutex);
+    
+    int fan_fd = open("/dev/icc_fan", O_RDWR); // 对齐原版采用标准可读写 O_RDWR 打开
     if (fan_fd > 0) {
-        char data[] = {0x00, 0x00, 0x00, 0x00, 0x00, target_temp, 0x00, 0x00, 0x00, 0x00};
-        ioctl(fan_fd, 0xC01C8F07, data);
+        // 核心加固：分配 28 字节完整缓冲区，彻底终结栈溢出 Bug
+        uint8_t buf[ICC_FAN_CMD_LEN];
+        memset(buf, 0, sizeof(buf));
+        
+        // 目标温度严格写入到 Offset 5
+        buf[ICC_FAN_THRESHOLD_OFFSET] = target_temp;
+        
+        ioctl(fan_fd, 0xC01C8F07UL, buf);
         close(fan_fd);
     }
-  pthread_mutex_unlock(&g_runtime_mount_state_mutex); // 释放锁
+    pthread_mutex_unlock(&g_runtime_mount_state_mutex); // 释放锁
 }
 
 // 供外部独立事件源跨文件调用的标准包装函数
