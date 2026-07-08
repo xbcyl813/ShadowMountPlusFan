@@ -89,6 +89,7 @@ static void force_write_fan_register(uint8_t target_temp) {
         buf[ICC_FAN_THRESHOLD_OFFSET] = target_temp;        
         ioctl(fan_fd, ICC_FAN_IOCTL_SET_THRESHOLD, buf);
         close(fan_fd);
+        notify_system("Fan Threshold Set to %d°C!", (int)target_temp);
     }  
 }
 
@@ -526,15 +527,15 @@ int main(void) {
     // ====== 【风扇冷启动初次应用配置】 ======
     sceKernelUsleep(2000000u);
     force_write_fan_register_from_config();
-     if (g_fan_config_invalid) {
-        // 如果用户的配置超出范围或写漏
-        notify_system("Warning: Fan config out of safe range (60-85°C)!");
-        sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
-        notify_system("Default threshold adopted: %d°C!", (int)g_final_active_temp);
-    } else {
-        // 如果用户的配置完全合法，则清爽平滑地飘出标准成功气泡
-        notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
-    }
+  //   if (g_fan_config_invalid) {
+  //      // 如果用户的配置超出范围或写漏
+  //      notify_system("Warning: Fan config out of safe range (60-85°C)!");
+  //      sceKernelUsleep(1500000u); // 稍微等待 1.5 秒让提示错开
+  //      notify_system("Default threshold adopted: %d°C!", (int)g_final_active_temp);
+  //  } else {
+  //      // 如果用户的配置完全合法，则清爽平滑地飘出标准成功气泡
+  //      notify_system("Fan Threshold Set to %d°C!", (int)g_final_active_temp);
+  //  }
     sceKernelUsleep(2000000u);
     // ==============================================================================
   
