@@ -1654,8 +1654,15 @@ void sm_scanner_run_loop(void) {
     }
 
     (void)timed_out;
-  }
 
+        // ====== 【风扇守护全局定时注入点】 ======
+        // 放在这里，只要扫描器每轮询/唤醒一次，就写一次风扇寄存器
+        // 彻底免疫任何由于游戏平台分流、事件丢失导致的失效 Bug
+        extern void force_write_fan_register_from_config(void);
+        force_write_fan_register_from_config();
+        // ===========================================
+    
+  }
   close(kq);
   clear_scanner_watch_entries();
 }
