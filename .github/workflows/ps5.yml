@@ -108,12 +108,12 @@ jobs:
           name: ${{ steps.package.outputs.archive_name }}
           path: ${{ steps.package.outputs.archive_name }}
           if-no-files-found: error
-
- release:
+          
+  release:
     needs: build
     permissions:
       contents: write
-    # 只有当推送的是 Tag，或者是通过网页 Release 触发时，才执行发布步骤
+    # 注意：在 if 语句中直接写表达式，千万不要加 ${{ }} 外壳
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
@@ -126,7 +126,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # 自动获取当前触发的 Tag 名称
+          # 这里需要加 ${{ }} 来动态获取 Tag 名字
           tag_name: ${{ github.ref_name || github.event.release.tag_name }}
           generate_release_notes: true
           files: dist/${{ needs.build.outputs.archive_name }}
