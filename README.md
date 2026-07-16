@@ -10,6 +10,8 @@ Therefore, a memory-resident program must periodically refresh the fan control v
 
 Consequently, this modification relies on a memory-resident SMP program to detect the console's operational status in real time. It automatically rewrites the temperature threshold data into the Southbridge fan controller whenever a state change occurs, such as starting or exiting a game.
 
+The modified Shadowmount Plus source code files include:main.c, sm_kstuff.c, sm_config_mount.c, sm_types.h.
+
 This modified plugin essentially inserts a piece of code into the original ShadowMountPlus_1.6beta16 source code to configure the Southbridge fan control parameters based on a configuration file. The core code logic is as follows:
 
       int fan_fd = open("/dev/icc_fan", O_RDWR);   //Access the Southbridge fan device in read/write mode.
