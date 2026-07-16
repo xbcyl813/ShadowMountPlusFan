@@ -6,8 +6,7 @@ For unknown reasons, a jailbroken PS5 console's Southbridge loses control over t
 This modified plugin essentially inserts a piece of code into the original ShadowMountPlus_1.6beta16 source code to configure the Southbridge fan control parameters based on a configuration file. The core code logic is as follows:
 
  `int fan_fd = open("/dev/icc_fan", O_RDWR);   //Access the Southbridge fan device in read/write mode.`
- 
-       ` if (fan_fd > 0) {`
+        ` if (fan_fd > 0) {`
        
           ` uint8_t buf[28] = {0};    // Allocates a 28-byte buffer. For consoles running higher firmware versions (10.xx and above), a 28-byte buffer is mandatory to save fan data.`
           
@@ -15,8 +14,7 @@ This modified plugin essentially inserts a piece of code into the original Shado
           
           ` ioctl(fan_fd, 0xC01C8F07UL, buf);  //Write temperature data to the fan device controller.`
           
-          ` close(fan_fd);`
-          
+          ` close(fan_fd);`          
  `   }  `
  
     
