@@ -80,7 +80,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version_tag="$(git describe --abbrev=6 --dirty --always --tags 2>/dev/null || echo "${GITHUB_SHA::7}")"
+          version_tag="${GITHUB_REF_NAME:-${GITHUB_SHA::7}}"          
           archive_name="ShadowMountPlus_${version_tag}.zip"
           manifest_file=".github/release-files.txt"
 
@@ -113,7 +113,6 @@ jobs:
     needs: build
     permissions:
       contents: write
-    # 注意：在 if 语句中直接写表达式，千万不要加 ${{ }} 外壳
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'
     runs-on: ubuntu-latest
     steps:
@@ -122,11 +121,11 @@ jobs:
         with:
           name: ${{ needs.build.outputs.archive_name }}
           path: dist
+          merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # 这里需要加 ${{ }} 来动态获取 Tag 名字
           tag_name: ${{ github.ref_name || github.event.release.tag_name }}
           generate_release_notes: true
           files: dist/${{ needs.build.outputs.archive_name }}
