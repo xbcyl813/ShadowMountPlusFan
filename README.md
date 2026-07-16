@@ -5,17 +5,13 @@ For unknown reasons, a jailbroken PS5 console's Southbridge loses control over t
 
 This modified plugin essentially inserts a piece of code into the original ShadowMountPlus_1.6beta16 source code to configure the Southbridge fan control parameters based on a configuration file. The core code logic is as follows:
 
- `int fan_fd = open("/dev/icc_fan", O_RDWR);   //Access the Southbridge fan device in read/write mode.`
-        ` if (fan_fd > 0) {`
-       
-          ` uint8_t buf[28] = {0};    // Allocates a 28-byte buffer. For consoles running higher firmware versions (10.xx and above), a 28-byte buffer is mandatory to save fan data.`
-          
-          ` buf[5] = target_temp;     // Target temperature is written to Offset 5. `  
-          
-          ` ioctl(fan_fd, 0xC01C8F07UL, buf);  //Write temperature data to the fan device controller.`
-          
-          ` close(fan_fd);`          
- `   }  `
+ `int fan_fd = open("/dev/icc_fan", O_RDWR);   //Access the Southbridge fan device in read/write mode.
+         if (fan_fd > 0) {
+           uint8_t buf[28] = {0};    // Allocates a 28-byte buffer. For consoles running higher firmware versions (10.xx and above), a 28-byte buffer is mandatory to save fan data.
+           buf[5] = target_temp;     // Target temperature is written to Offset 5.   
+           ioctl(fan_fd, 0xC01C8F07UL, buf);  //Write temperature data to the fan device controller.
+           close(fan_fd);          
+    } `
  
     
 This code writes the specified temperature thresholds to the Southbridge fan controller by sending the 0xC01C8F07 I/O control code (IOCTL) to its low-level driver. This control logic is identical to that used in other fan control plugins like PHU and etaHEN. Aside from this specific modification, I have not altered any other processing logic in the original ShadowMountPlus_1.6beta16.
