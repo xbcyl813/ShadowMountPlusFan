@@ -5,7 +5,7 @@ For unknown reasons, a jailbroken PS5 console's Southbridge loses control over t
 
 This modified plugin essentially inserts a piece of code into the original ShadowMountPlus_1.6beta16 source code to configure the Southbridge fan control parameters based on a configuration file. The core code logic is as follows:
 
-     ` int fan_fd = open("/dev/icc_fan", O_RDWR);   //Access the Southbridge fan device in read/write mode.
+      int fan_fd = open("/dev/icc_fan", O_RDWR);   //Access the Southbridge fan device in read/write mode.
         
         if (fan_fd > 0) {
          
@@ -17,7 +17,7 @@ This modified plugin essentially inserts a piece of code into the original Shado
            
            close(fan_fd);          
            
-         } `
+         }
      
 This code writes the specified temperature thresholds to the Southbridge fan controller by sending the 0xC01C8F07 I/O control code (IOCTL) to its low-level driver. This control logic is identical to that used in other fan control plugins like PHU and etaHEN. Aside from this specific modification, I have not altered any other processing logic in the original ShadowMountPlus_1.6beta16.
 
